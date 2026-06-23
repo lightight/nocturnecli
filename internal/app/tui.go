@@ -50,7 +50,6 @@ var slashCommands = []slashItem{
 	{"/models", "list available models"},
 	{"/level", "thinking: off · normal · extended"},
 	{"/key", "save your API key (remembered everywhere)"},
-	{"/paste", "attach an image from the clipboard"},
 	{"/image", "attach an image file"},
 	{"/auto", "toggle auto-accept for edits & commands"},
 	{"/stream", "toggle live response streaming"},
@@ -1439,8 +1438,6 @@ func (m *tuiModel) runSlash(line string) (tea.Model, tea.Cmd) {
 			m.remote = hub
 			m.push(m.remoteInfo())
 		}
-	case "/paste":
-		return m, grabImageCmd()
 	case "/image":
 		if arg == "" {
 			m.push(stErr.Render("  usage: /image <path>"))

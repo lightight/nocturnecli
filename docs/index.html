@@ -100,7 +100,9 @@
     padding:20px clamp(16px,3.5vw,26px) 24px;
     font:14px/1.7 var(--mono);
     min-height:330px;            /* reserve space so typing doesn't shift layout */
-    white-space:pre-wrap;overflow-wrap:anywhere;
+    /* normal (not pre-wrap) so the source newlines between rows don't render as
+       blank lines and inflate the box; indents below use &nbsp; where needed */
+    white-space:normal;overflow-wrap:anywhere;
   }
   @media(max-width:520px){.term-body{font-size:12.5px;min-height:300px}}
 
@@ -120,9 +122,12 @@
   .cursor{display:inline-block;width:8px;height:16px;background:var(--amber);vertical-align:-3px;margin-left:3px;border-radius:1px;animation:blink 1.1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
 
-  /* typing enhancement — only active when JS adds .is-typing-enabled */
-  .is-typing-enabled .ln{display:none}
-  .is-typing-enabled .ln.show{display:block;animation:lnin .2s var(--ease) both}
+  /* typing enhancement — only active when JS adds .is-typing-enabled.
+     Hidden lines keep their layout box (visibility, not display) so the
+     terminal reserves its full height up front and revealing lines never
+     pushes the rest of the page down. */
+  .is-typing-enabled .ln{visibility:hidden}
+  .is-typing-enabled .ln.show{visibility:visible;animation:lnin .2s var(--ease) both}
   @keyframes lnin{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}
   .is-typing-enabled .cursor{animation:none}          /* hold steady mid-stream */
   .is-typing-enabled.done .cursor{animation:blink 1.1s steps(1) infinite}
@@ -295,13 +300,13 @@
           <div class="ln gap" data-type data-text="add a /health endpoint to the server and verify it"><span class="c-pink">› </span><span class="t"></span></div>
           <div class="ln gap" data-type data-text="I'll read the server, add the route, then run it and curl it."><span class="t c-muted"></span></div>
           <div class="ln gap"><span class="c-violet">● </span><span class="c-blue">read_file</span><span class="c-faint">(main.go)</span></div>
-          <div class="ln"><span class="c-faint">  └ </span><span class="res">28 lines</span></div>
+          <div class="ln"><span class="c-faint">&nbsp;&nbsp;└ </span><span class="res">28 lines</span></div>
           <div class="ln gap"><span class="c-violet">● </span><span class="c-blue">edit_file</span><span class="c-faint">(main.go)</span></div>
-          <div class="ln"><span class="c-faint">  └ </span><span class="c-green">+6 −0</span><span class="res">  ·  added /health handler</span></div>
+          <div class="ln"><span class="c-faint">&nbsp;&nbsp;└ </span><span class="c-green">+6 −0</span><span class="res">&nbsp;&nbsp;·&nbsp;&nbsp;added /health handler</span></div>
           <div class="ln gap"><span class="c-violet">● </span><span class="c-blue">run_command</span>&nbsp;<span class="c-faint">go run main.go &amp;</span></div>
-          <div class="ln"><span class="c-faint">  └ </span><span class="res">listening on :8080</span></div>
+          <div class="ln"><span class="c-faint">&nbsp;&nbsp;└ </span><span class="res">listening on :8080</span></div>
           <div class="ln gap"><span class="c-violet">● </span><span class="c-blue">run_command</span>&nbsp;<span class="c-faint">curl -s localhost:8080/health</span></div>
-          <div class="ln"><span class="c-faint">  └ </span><span class="c-green">{"status":"ok"}</span></div>
+          <div class="ln"><span class="c-faint">&nbsp;&nbsp;└ </span><span class="c-green">{"status":"ok"}</span></div>
           <div class="ln gap" data-type data-text="Done — /health returns 200 with {&quot;status&quot;:&quot;ok&quot;}."><span class="t"></span></div>
           <div class="ln gap"><span class="c-pink">› </span><span class="cursor" aria-hidden="true"></span></div>
         </div>
@@ -375,11 +380,11 @@
 <span class="pmt">$</span> git clone https://github.com/lightight/nocturnecli &amp;&amp; cd nocturnecli
 <span class="pmt">$</span> make install   <span class="cmt"># → ~/.local/bin/nocturne</span></div>
 
-    <p class="install-note reveal">Then set your key and run it:</p>
+    <p class="install-note reveal">Then launch it. No environment variables to set:</p>
     <div class="codeblk reveal">
       <button class="copy" type="button" data-copy-block>Copy</button>
-<span class="pmt">$</span> export NOCTURNE_API=noct_your_key   <span class="cmt"># or put it in a .env file</span>
 <span class="pmt">$</span> nocturne</div>
+    <p class="install-note reveal">Inside the app, run <code>/key noct_your_key</code> once. Your key is saved privately on your machine (<code>~/.config/nocturne</code>) and reused for every project, with no <code>export</code> and no per-folder <code>.env</code>.</p>
     <p class="install-note reveal">Default model is <code>navy:gpt-5.5</code>. Switch any time with <code>/model &lt;id&gt;</code>; model access is per-account.</p>
   </div>
 </section>
@@ -390,14 +395,18 @@
     <p class="lead reveal">Everything you need without leaving the prompt.</p>
     <div class="cmds reveal">
       <div class="cmd-row"><code>/help</code><span>List every command.</span></div>
+      <div class="cmd-row"><code>/key [noct_…]</code><span>Save your API key privately, reused across every project.</span></div>
       <div class="cmd-row"><code>/model [id]</code><span>Show or change the model.</span></div>
-      <div class="cmd-row"><code>/key [noct_…]</code><span>Save your API key to the private config — remembered from any directory.</span></div>
-      <div class="cmd-row"><code>/paste · Ctrl+V</code><span>Attach an image from the clipboard.</span></div>
-      <div class="cmd-row"><code>/image &lt;path&gt;</code><span>Attach an image file from disk.</span></div>
+      <div class="cmd-row"><code>/level</code><span>Thinking effort: off, normal, or extended.</span></div>
+      <div class="cmd-row"><code>/stream</code><span>Toggle live token streaming (on by default).</span></div>
+      <div class="cmd-row"><code>/image &lt;path&gt;</code><span>Attach an image (a file path, or Ctrl+V from the clipboard).</span></div>
       <div class="cmd-row"><code>/auto</code><span>Toggle auto-accept for edits &amp; commands.</span></div>
       <div class="cmd-row"><code>/cd &lt;dir&gt;</code><span>Change the working directory.</span></div>
       <div class="cmd-row"><code>/tokens</code><span>Show token usage &amp; daily quota.</span></div>
+      <div class="cmd-row"><code>/resume</code><span>Resume a saved chat from this directory.</span></div>
+      <div class="cmd-row"><code>/remote</code><span>Drive the session from your browser, end-to-end encrypted.</span></div>
       <div class="cmd-row"><code>/init</code><span>Generate a NOCTURNE.md for the project.</span></div>
+      <div class="cmd-row"><code>/update</code><span>Update Nocturne to the latest release.</span></div>
       <div class="cmd-row"><code>/clear</code><span>Clear the conversation.</span></div>
     </div>
   </div>

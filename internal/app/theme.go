@@ -70,7 +70,7 @@ func banner(version, model, cwd string) string {
 func tips() string {
 	rows := []string{
 		stDim.Render("• Ask me to read, edit, search files or run commands."),
-		stDim.Render("• Paste images with ") + stAccent.Render("Ctrl+V") + stDim.Render(" or ") + stAccent.Render("/paste") + stDim.Render("; drop a file path inline."),
+		stDim.Render("• Paste images with ") + stAccent.Render("Ctrl+V") + stDim.Render(", or drop a file path inline."),
 		stDim.Render("• ") + stAccent.Render("/help") + stDim.Render(" for commands · ") + stAccent.Render("Esc") + stDim.Render(" interrupts · ") + stAccent.Render("Ctrl+C") + stDim.Render(" quits."),
 	}
 	return strings.Join(rows, "\n")

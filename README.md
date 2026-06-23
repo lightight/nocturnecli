@@ -49,23 +49,22 @@ make install        # -> ~/.local/bin/nocturne
 ## Setup
 
 Nocturne needs an API key. Get one from your [Nocturne account page](https://nocturne.lol/account.html),
-then provide it any of these ways (highest precedence last):
-
-1. `~/.config/nocturne/config.json` (saved by `/key`; macOS: `~/Library/Application Support/nocturne`)
-2. a `.env` file in the current directory: `NOCTURNE_API=noct_…`
-3. the `NOCTURNE_API` environment variable
+then launch Nocturne and save it once with `/key`:
 
 ```sh
-export NOCTURNE_API=noct_your_key
 nocturne
+› /key noct_your_key
 ```
 
-Already have a key loaded from a `.env` or env var? Run **`/key`** (no argument) once
-inside the app to save it to the private config — after that Nocturne remembers it from
-any directory. Use `/key noct_…` to set a new or rotated key directly.
+The key is written to `~/.config/nocturne/config.json` (macOS: `~/Library/Application Support/nocturne`),
+with file permissions `0600`, and reused for every project on your machine. No `export`, no per-folder
+`.env`. A bare `/key` also works: it saves whatever key is already loaded.
 
-The default model is **`navy:gpt-5.5`** — change it with `/model <id>` in-app or `-m` on the
-command line. Model availability is per-account; use an id you've been granted.
+If you'd rather manage the key yourself, Nocturne still reads `NOCTURNE_API` from a local `.env` file or
+the environment (these take precedence over the saved config).
+
+The default model is **`navy:gpt-5.5`**; change it with `/model <id>` in-app or `-m` on the command
+line. Model availability is per-account, so use an id you've been granted.
 
 ## Usage
 
@@ -91,8 +90,7 @@ settle into the final formatted answer. Toggle it with `/stream`.
 | `/models`        | list the models your account can use            |
 | `/level`         | thinking level: `off` · `normal` · `extended`   |
 | `/key [noct_…]`  | save your API key to the private config (remembered everywhere) |
-| `/paste`         | attach an image from the clipboard (or `Ctrl+V`) |
-| `/image <path>`  | attach an image file                            |
+| `/image <path>`  | attach an image file (or `Ctrl+V` for the clipboard) |
 | `/auto`          | toggle auto-accept for edits & commands         |
 | `/stream`        | toggle live response streaming (on by default)  |
 | `/cd <dir>`      | change the working directory                    |
@@ -118,7 +116,7 @@ Nocturne runs as a full-screen TUI and reflows when you resize the terminal.
 
 Attach an image three ways:
 
-- press **Ctrl+V** (or `/paste`) to grab an image off the system clipboard,
+- press **Ctrl+V** to grab an image off the system clipboard,
 - `/image diagram.png`, or
 - drag a file into the terminal / mention a path inline, e.g. `explain ./diagram.png`.
 
