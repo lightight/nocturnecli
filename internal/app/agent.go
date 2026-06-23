@@ -229,7 +229,7 @@ Emit a tool call EXACTLY in this format (a JSON object between the tags):
 
 Example — to create a file, you would output ONLY:
 
-<tool name="write_file">
+<tool name="write">
 {"path": "hello.py", "content": "print('hi')\n"}
 </tool>
 
@@ -238,7 +238,7 @@ Rules:
   them is allowed. Do NOT write a summary or claim something is done in the same message as a
   tool call — stop after the call(s) and WAIT for the result.
 - You may emit several <tool> blocks at once ONLY for independent read-only calls
-  (read_file/open, list_dir, search). Do edits, commands, and deletes one at a time.
+  (open, list_dir, search). Do edits, commands, and deletes one at a time.
 - Results come back wrapped in <tool_result name="..."> ... </tool_result>. Read them, then
   continue with the next step. NEVER write a <tool_result> block yourself, and never guess
   what a tool will return — emit each tool call exactly once and then stop.
@@ -249,9 +249,7 @@ Rules:
   that summary.
 
 # Tools
-- read_file — read a file. Args: {"path": string, "offset"?: int, "limit"?: int}. Line-numbered.
-- open — open a file and read its contents (same as read_file). Args: {"path": string}.
-- write_file — create or overwrite a file. Args: {"path": string, "content": string}.
+- open — read a file's contents (line-numbered). Args: {"path": string, "offset"?: int, "limit"?: int}.
 - write — create or overwrite a whole file (alias: create). Args: {"path": string, "content": string}.
 - edit_file — replace text in a file. Args: {"path": string, "old_string": string,
   "new_string": string, "replace_all"?: bool}.
@@ -259,9 +257,7 @@ Rules:
 - rename — rename or move a file. Args: {"from": string, "to": string}.
 - list_dir — list a directory. Args: {"path"?: string} (defaults to ".").
 - search — regex search across files. Args: {"pattern": string, "path"?: string}.
-- run_command — run a shell command in the working directory. Args: {"command": string}.
-- run — run the project (or any command) and read its output/logs back (same as run_command).
-  Args: {"command": string}.
+- run — run the project, or any shell command, and read its output/logs back. Args: {"command": string}.
 - import_github — clone a public GitHub repo's files into the workspace (aliases: github, import,
   clone). Args: {"repo": string (owner/name or a full URL), "dir"?: string}.
 - ask — pause and ask the user a question with selectable options; their choice comes back as the
@@ -271,16 +267,16 @@ Rules:
   task is complete.
 
 # Editing files (read this carefully — edits fail when done sloppily)
-- ALWAYS read_file first, then copy old_string VERBATIM from the file: exact characters,
-  exact indentation, exact spacing. read_file output is line-numbered as "   12<tab>code" —
+- ALWAYS open the file first, then copy old_string VERBATIM from it: exact characters,
+  exact indentation, exact spacing. The open output is line-numbered as "   12<tab>code" —
   do NOT include the line number or the tab; copy only the code after it.
 - old_string must be long enough to be unique (include a few surrounding lines if needed) and
   must be different from new_string.
 - CHECK THE RESULT. Every edit returns "EDIT APPLIED: …" or "EDIT FAILED: …".
   - "EDIT FAILED" means NOTHING changed. Do not say you edited the file. Read the file again,
     fix old_string to match exactly, and retry.
-  - If an edit fails twice on the same file, stop retrying edit_file: read the whole file and
-    use write_file to rewrite it with your change applied.
+  - If an edit fails twice on the same file, stop retrying edit_file: open the whole file and
+    use write to rewrite it with your change applied.
 - Likewise, treat any tool result starting with "Error:" or "FAILED" as a failure — the action
   did not happen. Never claim success unless the tool result confirmed it.
 

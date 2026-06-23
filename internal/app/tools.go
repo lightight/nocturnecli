@@ -207,7 +207,7 @@ func clip(s string) string {
 func readFileTool(workdir string, a map[string]any) string {
 	path := argStr(a, "path")
 	if path == "" {
-		return "Error: read_file requires a 'path'"
+		return "Error: open requires a 'path'"
 	}
 	data, err := os.ReadFile(resolve(workdir, path))
 	if err != nil {
@@ -240,7 +240,7 @@ func readFileTool(workdir string, a map[string]any) string {
 func writeFileTool(workdir string, a map[string]any) string {
 	path := argStr(a, "path")
 	if path == "" {
-		return "Error: write_file requires a 'path'"
+		return "Error: write requires a 'path'"
 	}
 	full := resolve(workdir, path)
 	if dir := filepath.Dir(full); dir != "" {
@@ -303,12 +303,12 @@ func editFileTool(workdir string, a map[string]any) string {
 			}
 			return fmt.Sprintf("EDIT APPLIED: %s (matched ignoring whitespace).", path)
 		} else if n > 1 && !replaceAll {
-			return fmt.Sprintf("EDIT FAILED: old_string matches %d places in %s (ignoring whitespace) — NO changes were made. Add more context, or use write_file.", n, path)
+			return fmt.Sprintf("EDIT FAILED: old_string matches %d places in %s (ignoring whitespace) — NO changes were made. Add more context, or use write.", n, path)
 		}
 	}
 
 	return "EDIT FAILED: old_string was not found in " + path + ", so NO changes were made. " +
-		"Re-read the file and copy the exact text (including indentation) into old_string, or use write_file to rewrite the file.\n" +
+		"Re-read the file and copy the exact text (including indentation) into old_string, or use write to rewrite the file.\n" +
 		closestHint(content, oldStr)
 }
 
@@ -519,7 +519,7 @@ func isBinary(data []byte) bool {
 func runCommandTool(workdir string, a map[string]any) string {
 	command := argStr(a, "command")
 	if command == "" {
-		return "Error: run_command requires a 'command'"
+		return "Error: run requires a 'command'"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
 	defer cancel()
