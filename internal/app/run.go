@@ -25,7 +25,8 @@ Usage:
   nocturne --help           show this help
 
 Configuration:
-  API key   NOCTURNE_API environment variable, a local .env file, or /key in-app
+  API key   NOCTURNE_API env var or a local .env; run /key in-app to save it
+            permanently (private config, used from any directory)
   Model     default ` + DefaultModel + `; pick with /model, list with /models or -m
   Thinking  /level off · normal · extended (reasoning models)
   Stream    live responses on by default; toggle with /stream

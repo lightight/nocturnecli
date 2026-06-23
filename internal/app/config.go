@@ -30,8 +30,9 @@ type Config struct {
 	Level       string   `json:"level,omitempty"`       // thinking: off · normal · extended
 	Temperature *float64 `json:"temperature,omitempty"` // 0–2 (unset = API default)
 
-	path       string // resolved config-file path (not serialized)
-	keyFromEnv bool   // true when APIKey came from the environment
+	path         string // resolved config-file path (not serialized)
+	keyFromEnv   bool   // true when APIKey came from the environment
+	keyPersisted bool   // true when a key was already present in the config file
 }
 
 type persisted struct {
@@ -58,11 +59,15 @@ func configPath() string { return filepath.Join(configDir(), "config.json") }
 
 // LoadConfig reads the persisted config, layers a local .env on top, then
 // lets real environment variables win for the API key.
-func LoadConfig() *Config {
+func LoadConfig() *Config { return loadConfig(configPath()) }
+
+// loadConfig is the path-parameterized core of LoadConfig, split out so tests
+// can exercise the persist/reload round-trip against a temp file.
+func loadConfig(path string) *Config {
 	loadDotEnv(".env")
 
 	cfg := &Config{Model: DefaultModel, BaseURL: DefaultBaseURL, Stream: true}
-	cfg.path = configPath()
+	cfg.path = path
 
 	if data, err := os.ReadFile(cfg.path); err == nil {
 		var p persisted
@@ -79,6 +84,7 @@ func LoadConfig() *Config {
 			cfg.Level = p.Level
 			cfg.Temperature = p.Temperature
 			cfg.APIKey = p.APIKey
+			cfg.keyPersisted = p.APIKey != ""
 		}
 	}
 
@@ -114,6 +120,36 @@ func (c *Config) SetAPIKey(k string) {
 	c.keyFromEnv = false
 }
 
+// PersistKey marks the currently-loaded key to be written to the private
+// config file on the next Save, even if it originated from the environment or
+// a local .env. This backs a bare `/key`: "remember the key I'm already using,
+// everywhere" — once saved, LoadConfig finds it from any working directory.
+func (c *Config) PersistKey() { c.keyFromEnv = false }
+
+// MaskedKey returns a redacted form of the API key for display in
+// confirmations and status lines. It never reveals the full secret.
+func (c *Config) MaskedKey() string {
+	k := c.APIKey
+	if k == "" {
+		return ""
+	}
+	if len(k) <= 8 {
+		return "…"
+	}
+	return k[:5] + "…" + k[len(k)-4:]
+}
+
+// KeyNeedsPersist reports whether a key is loaded from the environment or a
+// local .env but isn't yet saved in the private config — i.e. running `/key`
+// would make it available from every directory.
+func (c *Config) KeyNeedsPersist() bool {
+	return c.APIKey != "" && c.keyFromEnv && !c.keyPersisted
+}
+
+// ConfigPath reports where the persisted config (including a saved key) lives,
+// so callers can tell the user exactly where their key was written.
+func ConfigPath() string { return configPath() }
+
 // Save writes model/base-url (and a manually-entered key) back to disk. A
 // key sourced from the environment is never persisted, to avoid copying a
 // secret the user is already managing elsewhere.
@@ -124,6 +160,7 @@ func (c *Config) Save() error {
 	p := persisted{Model: normalizeModelID(c.Model), BaseURL: c.BaseURL, Stream: &c.Stream, Level: c.Level, Temperature: c.Temperature}
 	if !c.keyFromEnv {
 		p.APIKey = c.APIKey
+		c.keyPersisted = c.APIKey != ""
 	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {

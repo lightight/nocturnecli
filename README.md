@@ -51,7 +51,7 @@ make install        # -> ~/.local/bin/nocturne
 Nocturne needs an API key. Get one from your [Nocturne account page](https://nocturne.lol/account.html),
 then provide it any of these ways (highest precedence last):
 
-1. `~/.config/nocturne/config.json` (saved by `/key` inside the app)
+1. `~/.config/nocturne/config.json` (saved by `/key`; macOS: `~/Library/Application Support/nocturne`)
 2. a `.env` file in the current directory: `NOCTURNE_API=noct_…`
 3. the `NOCTURNE_API` environment variable
 
@@ -59,6 +59,10 @@ then provide it any of these ways (highest precedence last):
 export NOCTURNE_API=noct_your_key
 nocturne
 ```
+
+Already have a key loaded from a `.env` or env var? Run **`/key`** (no argument) once
+inside the app to save it to the private config — after that Nocturne remembers it from
+any directory. Use `/key noct_…` to set a new or rotated key directly.
 
 The default model is **`navy:gpt-5.5`** — change it with `/model <id>` in-app or `-m` on the
 command line. Model availability is per-account; use an id you've been granted.
@@ -86,7 +90,7 @@ settle into the final formatted answer. Toggle it with `/stream`.
 | `/model [id]`    | open the model picker, or set a model by id     |
 | `/models`        | list the models your account can use            |
 | `/level`         | thinking level: `off` · `normal` · `extended`   |
-| `/key noct_…`    | set & save your API key                          |
+| `/key [noct_…]`  | save your API key to the private config (remembered everywhere) |
 | `/paste`         | attach an image from the clipboard (or `Ctrl+V`) |
 | `/image <path>`  | attach an image file                            |
 | `/auto`          | toggle auto-accept for edits & commands         |

@@ -49,7 +49,7 @@ var slashCommands = []slashItem{
 	{"/model", "pick a model (or /model <id>)"},
 	{"/models", "list available models"},
 	{"/level", "thinking: off · normal · extended"},
-	{"/key", "set & save your API key"},
+	{"/key", "save your API key (remembered everywhere)"},
 	{"/paste", "attach an image from the clipboard"},
 	{"/image", "attach an image file"},
 	{"/auto", "toggle auto-accept for edits & commands"},
@@ -983,6 +983,10 @@ func (m *tuiModel) greet() {
 	m.lines = append(m.lines, banner(m.ver, m.cfg.Model, prettyPath(m.work)), "", tips())
 	if m.cfg.APIKey == "" {
 		m.lines = append(m.lines, "", stErr.Render("  No API key found. Set NOCTURNE_API (env or .env), or run /key noct_…"))
+	} else if m.cfg.KeyNeedsPersist() {
+		// Key is loaded from env/.env but not yet saved to the private config —
+		// a bare /key would make it permanent across every directory.
+		m.lines = append(m.lines, stHint.Render("  tip: run /key to remember this key everywhere"))
 	}
 }
 
@@ -1379,12 +1383,21 @@ func (m *tuiModel) runSlash(line string) (tea.Model, tea.Cmd) {
 		m.push(stOK.Render("  thinking level: " + a))
 	case "/key":
 		if arg == "" {
-			m.push(stErr.Render("  usage: /key noct_…"))
+			// Bare /key: remember the key already loaded (from env or .env)
+			// in the private config so it's used from any directory.
+			if m.cfg.APIKey == "" {
+				m.push(stErr.Render("  usage: /key noct_…  (no key is currently loaded to remember)"))
+				break
+			}
+			m.cfg.PersistKey()
 		} else {
 			m.cfg.SetAPIKey(arg)
-			_ = m.cfg.Save()
-			m.push(stOK.Render("  API key saved"))
 		}
+		if err := m.cfg.Save(); err != nil {
+			m.push(stErr.Render("  couldn't save key: " + err.Error()))
+			break
+		}
+		m.push(stOK.Render("  API key " + m.cfg.MaskedKey() + " saved to " + prettyPath(ConfigPath())))
 	case "/auto":
 		m.autoAccept = !m.autoAccept
 		m.push(stHint.Render("  auto-accept " + onOff(m.autoAccept)))
