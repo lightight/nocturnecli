@@ -126,7 +126,10 @@
      Hidden lines keep their layout box (visibility, not display) so the
      terminal reserves its full height up front and revealing lines never
      pushes the rest of the page down. */
-  .is-typing-enabled .ln{visibility:hidden}
+  /* min-height reserves one row even for not-yet-typed lines (whose .t span is
+     empty and would otherwise collapse), so the box height — and the page below
+     it — stays put no matter how many lines the scroll has revealed. */
+  .is-typing-enabled .ln{visibility:hidden;min-height:1.7em}
   .is-typing-enabled .ln.show{visibility:visible;animation:lnin .2s var(--ease) both}
   @keyframes lnin{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}
   .is-typing-enabled .cursor{animation:none}          /* hold steady mid-stream */
@@ -145,9 +148,6 @@
   .btn-ghost{border-color:var(--line-2);color:var(--ink);background:transparent}
   .btn-ghost:hover{border-color:var(--violet);background:rgba(167,139,250,.09)}
   .meta-line{margin:16px auto 0;font:500 13.5px var(--mono);color:var(--faint);letter-spacing:.01em}
-  .replay{margin:14px auto 0;display:block;background:none;border:0;color:var(--faint);font:500 13px var(--sans);cursor:pointer;transition:color .15s}
-  .replay:hover{color:var(--amber)}
-  .replay[hidden]{display:none}
 
   /* ── sections ──────────────────────── */
   section{padding:84px 0}
@@ -311,7 +311,6 @@
           <div class="ln gap"><span class="c-pink">› </span><span class="cursor" aria-hidden="true"></span></div>
         </div>
       </div>
-      <button class="replay" type="button" data-replay hidden>↻ Replay</button>
     </div>
 
     <div class="cta reveal">
@@ -483,69 +482,61 @@
     document.querySelectorAll('[data-panel]').forEach(p => p.hidden = (p.dataset.panel !== os));
   }));
 
-  /* ---- terminal typing (progressive enhancement) ----
+  /* ---- terminal: scroll-driven reveal ----
      The full transcript is in the DOM by default, so no-JS and reduced-motion
-     users see the finished session. JS only *re-types* it when motion is allowed. */
+     users see the finished session. When motion is allowed, scroll position
+     scrubs the session: lines reveal as the visitor scrolls down and rewind as
+     they scroll back up — it never plays on its own clock. Hidden lines keep
+     their layout box (visibility, not display), so the terminal stays a fixed
+     height and revealing lines never shifts the page. */
   (function(){
     const term = document.querySelector('[data-term]');
     if (!term) return;
     const reduce = matchMedia('(prefers-reduced-motion: reduce)');
-    const replay = document.querySelector('[data-replay]');
-    const stage  = term.closest('.stage');
+    const stage  = term.closest('.stage') || term;
     const lines  = Array.from(term.querySelectorAll('.ln'));
-    let running = false;
 
-    const wait = ms => new Promise(r => setTimeout(r, ms));
-    function typeInto(el, text, speed){
-      return new Promise(resolve => {
-        el.textContent = ''; let i = 0;
-        (function step(){
-          if (i >= text.length) return resolve();
-          el.textContent += text[i++];
-          setTimeout(step, speed + (Math.random()*speed*0.5));
-        })();
+    if (reduce.matches) return;          // leave the static transcript exactly as-is
+
+    term.classList.add('is-typing-enabled');
+
+    const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+    let shown = -1;
+
+    // Reveal the first N lines for scroll progress p (0..1); rewind when p drops.
+    function render(p){
+      term.classList.toggle('done', p >= 1);     // blink the prompt cursor once complete
+      const n = Math.round(p * lines.length);
+      if (n === shown) return;                    // only touch the DOM when the count changes
+      shown = n;
+      lines.forEach((ln, i) => {
+        const on = i < n;
+        ln.classList.toggle('show', on);          // .show fades each line in via CSS
+        if (ln.hasAttribute('data-type')) ln.querySelector('.t').textContent = on ? ln.dataset.text : '';
       });
     }
 
-    async function play(){
-      if (running) return; running = true;
-      term.classList.add('is-typing-enabled'); term.classList.remove('done');
-      if (replay) replay.hidden = true;
-      // reset
-      lines.forEach(ln => {
-        ln.classList.remove('show');
-        if (ln.hasAttribute('data-type')) ln.querySelector('.t').textContent = '';
-      });
-      for (const ln of lines){
-        ln.classList.add('show');
-        if (ln.hasAttribute('data-type')){
-          const isPrompt = ln.querySelector('.c-pink');
-          await typeInto(ln.querySelector('.t'), ln.dataset.text, isPrompt ? 34 : 15);
-          await wait(280);
-        } else {
-          await wait(190);
-        }
-      }
-      term.classList.add('done');
-      if (replay && !reduce.matches) replay.hidden = false;
-      running = false;
+    // Progress runs 0 → 1 over roughly the first viewport of scrolling: empty
+    // (just the boot card) at the top, fully typed by the time the terminal
+    // reaches the top of the screen.
+    function progress(){
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      const scrolled = window.scrollY || window.pageYOffset || 0;
+      const stageTop = stage.getBoundingClientRect().top + scrolled;  // distance from doc top
+      const range = Math.max(vh * 0.5, stageTop);
+      return clamp(scrolled / range, 0, 1);
     }
 
-    if (reduce.matches){
-      // leave the static transcript exactly as-is; no typing, no replay
-      return;
+    let ticking = false;
+    function onScroll(){
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => { render(progress()); ticking = false; });
     }
 
-    // start once the terminal scrolls into view (it's above the fold, so usually immediate)
-    if ('IntersectionObserver' in window){
-      const io = new IntersectionObserver((entries, obs) => {
-        if (entries.some(en => en.isIntersecting)){ obs.disconnect(); play(); }
-      }, { threshold: 0.35 });
-      io.observe(stage || term);
-    } else {
-      play();
-    }
-    replay?.addEventListener('click', play);
+    render(progress());
+    addEventListener('scroll', onScroll, { passive: true });
+    addEventListener('resize', onScroll, { passive: true });
   })();
 
   /* ---- scroll progress bar (scroll-linked, rAF-throttled) ---- */
