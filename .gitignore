@@ -1,0 +1,12 @@
+# build output
+/nocturne
+/dist/
+*.exe
+
+# local secrets & config
+.env
+*.log
+.impeccable/
+
+# os cruft
+.DS_Store
