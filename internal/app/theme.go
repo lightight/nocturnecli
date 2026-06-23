@@ -122,8 +122,8 @@ func renderToolResult(output string) string {
 func toolDisplayName(name string) string { return name }
 
 func toolArgsPreview(tc ToolCall) string {
-	switch tc.Name {
-	case "read_file", "write_file", "edit_file":
+	switch canonicalTool(tc.Name) {
+	case "read_file", "write_file", "edit_file", "delete":
 		return "(" + argStr(tc.Args, "path") + ")"
 	case "list_dir":
 		p := argStr(tc.Args, "path")
@@ -135,6 +135,12 @@ func toolArgsPreview(tc ToolCall) string {
 		return "(" + argStr(tc.Args, "pattern") + ")"
 	case "run_command":
 		return " " + oneLine(argStr(tc.Args, "command"), 80)
+	case "rename":
+		return "(" + argStr(tc.Args, "from") + " → " + argStr(tc.Args, "to") + ")"
+	case "import_github":
+		return "(" + repoArg(tc.Args) + ")"
+	case "ask":
+		return " " + oneLine(argStr(tc.Args, "question"), 60)
 	}
 	return ""
 }

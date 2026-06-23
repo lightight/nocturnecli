@@ -30,11 +30,29 @@ const (
 	cmdTimeout    = 120 * time.Second
 )
 
+// canonicalTool maps a tool name — including the friendly names and aliases
+// the model is offered — to the canonical implementation it dispatches to.
+// Display code keeps the name the model actually emitted; only behaviour is
+// routed through this.
+func canonicalTool(name string) string {
+	switch name {
+	case "write", "create":
+		return "write_file"
+	case "open":
+		return "read_file"
+	case "run":
+		return "run_command"
+	case "github", "import", "clone":
+		return "import_github"
+	}
+	return name
+}
+
 // needsApproval reports whether a tool mutates state / runs code and must be
 // confirmed by the user (unless auto-accept is on).
 func needsApproval(name string) bool {
-	switch name {
-	case "write_file", "edit_file", "run_command":
+	switch canonicalTool(name) {
+	case "write_file", "edit_file", "run_command", "delete", "rename", "import_github":
 		return true
 	}
 	return false
@@ -64,12 +82,12 @@ func argBool(a map[string]any, k string) bool {
 }
 
 // summarize renders a one-line label for a tool call, e.g. read_file(main.go).
+// It keeps the name the model emitted (so aliases like open/run/create show as
+// typed) while routing the argument layout through the canonical name.
 func (tc ToolCall) summarize() string {
-	switch tc.Name {
-	case "read_file":
-		return fmt.Sprintf("read_file(%s)", argStr(tc.Args, "path"))
-	case "write_file":
-		return fmt.Sprintf("write_file(%s)", argStr(tc.Args, "path"))
+	switch canonicalTool(tc.Name) {
+	case "read_file", "write_file":
+		return fmt.Sprintf("%s(%s)", tc.Name, argStr(tc.Args, "path"))
 	case "edit_file":
 		return fmt.Sprintf("edit_file(%s)", argStr(tc.Args, "path"))
 	case "list_dir":
@@ -81,7 +99,17 @@ func (tc ToolCall) summarize() string {
 	case "search":
 		return fmt.Sprintf("search(%q)", argStr(tc.Args, "pattern"))
 	case "run_command":
-		return fmt.Sprintf("run_command: %s", oneLine(argStr(tc.Args, "command"), 80))
+		return fmt.Sprintf("%s: %s", tc.Name, oneLine(argStr(tc.Args, "command"), 80))
+	case "delete":
+		return fmt.Sprintf("delete(%s)", argStr(tc.Args, "path"))
+	case "rename":
+		return fmt.Sprintf("rename(%s → %s)", argStr(tc.Args, "from"), argStr(tc.Args, "to"))
+	case "import_github":
+		return fmt.Sprintf("import_github(%s)", repoArg(tc.Args))
+	case "ask":
+		return "ask: " + oneLine(argStr(tc.Args, "question"), 70)
+	case "finish":
+		return "finish"
 	default:
 		return tc.Name
 	}
@@ -89,7 +117,7 @@ func (tc ToolCall) summarize() string {
 
 // details returns a multi-line preview shown in the confirmation prompt.
 func (tc ToolCall) details(workdir string) string {
-	switch tc.Name {
+	switch canonicalTool(tc.Name) {
 	case "run_command":
 		return "$ " + argStr(tc.Args, "command")
 	case "write_file":
@@ -100,6 +128,12 @@ func (tc ToolCall) details(workdir string) string {
 			argStr(tc.Args, "path"),
 			oneLine(argStr(tc.Args, "old_string"), 160),
 			oneLine(argStr(tc.Args, "new_string"), 160))
+	case "delete":
+		return "remove " + argStr(tc.Args, "path")
+	case "rename":
+		return fmt.Sprintf("%s → %s", argStr(tc.Args, "from"), argStr(tc.Args, "to"))
+	case "import_github":
+		return "git clone " + normalizeRepoURL(repoArg(tc.Args)) + " (public repo)"
 	}
 	return ""
 }
@@ -114,7 +148,7 @@ func execute(tc ToolCall, workdir string) string {
 			"Re-send the <tool name=%q> call with exactly one valid JSON object (no extra braces, no trailing text). You sent: %s",
 			tc.Name, tc.Name, raw)
 	}
-	switch tc.Name {
+	switch canonicalTool(tc.Name) {
 	case "read_file":
 		return readFileTool(workdir, tc.Args)
 	case "write_file":
@@ -127,6 +161,21 @@ func execute(tc ToolCall, workdir string) string {
 		return searchTool(workdir, tc.Args)
 	case "run_command":
 		return runCommandTool(workdir, tc.Args)
+	case "delete":
+		return deleteFileTool(workdir, tc.Args)
+	case "rename":
+		return renameFileTool(workdir, tc.Args)
+	case "import_github":
+		return importGithubTool(workdir, tc.Args)
+	case "ask":
+		// ask is normally intercepted by the interactive loop; this is the
+		// non-interactive fallback so headless runs don't stall.
+		return "ask is unavailable in this mode. Proceed with your best judgment and state any assumption you made."
+	case "finish":
+		if s := strings.TrimSpace(argStr(tc.Args, "summary")); s != "" {
+			return s
+		}
+		return "Task complete."
 	default:
 		return "Error: unknown tool " + tc.Name
 	}
@@ -498,4 +547,152 @@ func runCommandTool(workdir string, a map[string]any) string {
 		result = "(no output)"
 	}
 	return clip(result)
+}
+
+func deleteFileTool(workdir string, a map[string]any) string {
+	path := argStr(a, "path")
+	if path == "" {
+		return "Error: delete requires a 'path'"
+	}
+	full := resolve(workdir, path)
+	info, err := os.Stat(full)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	if info.IsDir() {
+		return "Error: " + path + " is a directory; delete only removes files."
+	}
+	if err := os.Remove(full); err != nil {
+		return "Error: " + err.Error()
+	}
+	return "Deleted " + path
+}
+
+func renameFileTool(workdir string, a map[string]any) string {
+	from := argStr(a, "from")
+	to := argStr(a, "to")
+	if from == "" || to == "" {
+		return "Error: rename requires 'from' and 'to'"
+	}
+	src := resolve(workdir, from)
+	dst := resolve(workdir, to)
+	if _, err := os.Stat(src); err != nil {
+		return "Error: " + err.Error()
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return "Error: destination " + to + " already exists; choose another name or delete it first."
+	}
+	if dir := filepath.Dir(dst); dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return "Error: " + err.Error()
+	}
+	return fmt.Sprintf("Renamed %s → %s", from, to)
+}
+
+// importGithubTool shallow-clones a public repo into the working directory so
+// its files are available to the other tools.
+func importGithubTool(workdir string, a map[string]any) string {
+	repo := repoArg(a)
+	if repo == "" {
+		return "Error: import_github requires a 'repo' (owner/name or a GitHub URL)"
+	}
+	url := normalizeRepoURL(repo)
+
+	dest := argStr(a, "dir")
+	if dest == "" {
+		dest = argStr(a, "path")
+	}
+	if dest == "" {
+		dest = repoBaseName(url)
+	}
+	full := resolve(workdir, dest)
+	if _, err := os.Stat(full); err == nil {
+		return "Error: destination " + dest + " already exists; choose another 'dir' or delete it first."
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", url, full)
+	cmd.Dir = workdir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		if ctx.Err() == context.DeadlineExceeded {
+			msg = "timed out after " + cmdTimeout.String()
+		}
+		return "Error: git clone failed: " + oneLine(msg, 300)
+	}
+
+	entries, _ := os.ReadDir(full)
+	var names []string
+	for _, e := range entries {
+		name := e.Name()
+		if name == ".git" {
+			continue
+		}
+		if e.IsDir() {
+			name += "/"
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return fmt.Sprintf("Cloned %s into %s/ (%d top-level entr%s):\n%s",
+		url, dest, len(names), pluralY(len(names)), clip(strings.Join(names, "\n")))
+}
+
+// repoArg pulls the repo identifier from the common arg names a model might use.
+func repoArg(a map[string]any) string {
+	for _, k := range []string{"repo", "url", "repository", "name"} {
+		if v := strings.TrimSpace(argStr(a, k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// normalizeRepoURL turns "owner/name" or "github.com/owner/name" into a full
+// https clone URL, and leaves real URLs (https / git@) untouched.
+func normalizeRepoURL(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if strings.HasPrefix(repo, "http://") || strings.HasPrefix(repo, "https://") || strings.HasPrefix(repo, "git@") {
+		return repo
+	}
+	repo = strings.TrimPrefix(repo, "github.com/")
+	return "https://github.com/" + strings.Trim(repo, "/")
+}
+
+// repoBaseName derives a clone directory name from a repo URL/slug.
+func repoBaseName(url string) string {
+	u := strings.TrimSuffix(strings.TrimRight(url, "/"), ".git")
+	if i := strings.LastIndexByte(u, '/'); i >= 0 && i+1 < len(u) {
+		return u[i+1:]
+	}
+	if u == "" {
+		return "repo"
+	}
+	return u
+}
+
+// toStrings converts a decoded JSON array (e.g. ask "options") to []string,
+// dropping non-strings and blanks.
+func toStrings(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, e := range arr {
+		if s, ok := e.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func pluralY(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }

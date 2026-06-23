@@ -136,6 +136,14 @@ func runHeadless(cfg *Config, prompt string) error {
 
 		var results []toolResult
 		for _, tc := range calls {
+			if canonicalTool(tc.Name) == "finish" {
+				summary := strings.TrimSpace(argStr(tc.Args, "summary"))
+				if summary == "" {
+					summary = narration
+				}
+				fmt.Println(summary)
+				return nil
+			}
 			fmt.Fprintln(os.Stderr, stAccent.Render("● ")+tc.summarize())
 			results = append(results, toolResult{Name: tc.Name, Output: execute(tc, work)})
 		}

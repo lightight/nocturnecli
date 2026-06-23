@@ -29,6 +29,7 @@ const (
 	modeConfirm
 	modePicker
 	modeResume
+	modeAsk
 )
 
 // autoCompactThreshold is the context size (tokens) at which the conversation
@@ -94,6 +95,11 @@ type tuiModel struct {
 	pending []ToolCall
 	results []toolResult
 	confirm ToolCall
+
+	// `ask` tool — a question with selectable options, answered in the TUI
+	askQ    string
+	askOpts []string
+	askSel  int
 
 	streamCh  chan StreamEvent
 	streamBuf string
@@ -381,6 +387,8 @@ func (m *tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case modeConfirm:
 		return m.handleConfirmKey(msg)
+	case modeAsk:
+		return m.handleAskKey(msg)
 	case modePicker:
 		return m.handlePickerKey(msg)
 	case modeResume:
@@ -502,6 +510,39 @@ func (m *tuiModel) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.approve(true)
 	case "n", "esc":
 		return m.deny()
+	}
+	return m, nil
+}
+
+// handleAskKey drives the `ask` prompt: arrows / number keys to pick, enter to
+// confirm, esc to dismiss.
+func (m *tuiModel) handleAskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		m.quitting = true
+		return m, tea.Quit
+	case tea.KeyUp:
+		if m.askSel > 0 {
+			m.askSel--
+		}
+		return m, nil
+	case tea.KeyDown:
+		if m.askSel < len(m.askOpts)-1 {
+			m.askSel++
+		}
+		return m, nil
+	case tea.KeyEnter:
+		if len(m.askOpts) == 0 {
+			return m, nil
+		}
+		return m.answerAsk(m.askOpts[m.askSel])
+	case tea.KeyEsc:
+		return m.answerAsk("")
+	}
+	if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+		if i := int(s[0] - '1'); i < len(m.askOpts) {
+			return m.answerAsk(m.askOpts[i])
+		}
 	}
 	return m, nil
 }
@@ -747,6 +788,15 @@ func (m *tuiModel) advanceTools() tea.Cmd {
 	}
 
 	tc := m.pending[0]
+
+	// Control tools steer the loop instead of producing a fed-back result.
+	switch canonicalTool(tc.Name) {
+	case "finish":
+		return m.finishTask(tc)
+	case "ask":
+		return m.beginAsk(tc)
+	}
+
 	m.push(renderToolCall(tc))
 	m.toRemote("tool", "● "+tc.summarize())
 
@@ -760,6 +810,63 @@ func (m *tuiModel) advanceTools() tea.Cmd {
 	m.pending = m.pending[1:]
 	m.mode = modeThinking
 	return tea.Batch(m.startSpinner(), m.runToolCmd(tc))
+}
+
+// finishTask ends the agent loop: it shows the model's summary as the final
+// message and returns to input, without feeding anything back.
+func (m *tuiModel) finishTask(tc ToolCall) tea.Cmd {
+	summary := strings.TrimSpace(argStr(tc.Args, "summary"))
+	if summary == "" {
+		summary = "Done."
+	}
+	m.pending = nil
+	m.results = nil
+	m.mode = modeInput
+	if out := m.renderAssistant(summary); out != "" {
+		m.push(out)
+	}
+	m.toRemote("assistant", summary)
+	m.persistSession()
+	return nil
+}
+
+// beginAsk pauses the loop and presents the model's question with selectable
+// options; the chosen answer is fed back when the user picks one.
+func (m *tuiModel) beginAsk(tc ToolCall) tea.Cmd {
+	m.push(renderToolCall(tc))
+	m.toRemote("tool", "● "+tc.summarize())
+	m.askQ = strings.TrimSpace(argStr(tc.Args, "question"))
+	if m.askQ == "" {
+		m.askQ = "Which option?"
+	}
+	m.askOpts = toStrings(tc.Args["options"])
+	if len(m.askOpts) == 0 {
+		m.askOpts = []string{"Yes", "No"}
+	}
+	m.askSel = 0
+	m.mode = modeAsk
+	m.toRemote("status", "waiting for an answer in the terminal: "+m.askQ)
+	return nil
+}
+
+// answerAsk records the user's choice as the ask tool's result and resumes.
+func (m *tuiModel) answerAsk(choice string) (tea.Model, tea.Cmd) {
+	out := "User selected: " + choice
+	label := choice
+	if choice == "" {
+		out = "User dismissed the question without choosing."
+		label = "(dismissed)"
+	}
+	if len(m.pending) > 0 {
+		m.pending = m.pending[1:]
+	}
+	m.results = append(m.results, toolResult{Name: "ask", Output: out})
+	m.push(stHint.Render("  → " + label))
+	m.toRemote("tool", "  └ "+label)
+	m.askQ = ""
+	m.askOpts = nil
+	m.askSel = 0
+	return m, m.advanceTools()
 }
 
 func (m *tuiModel) handleToolDone(msg toolDoneMsg) (tea.Model, tea.Cmd) {
@@ -1073,6 +1180,9 @@ func (m *tuiModel) bottomView() string {
 	if m.mode == modeConfirm {
 		return m.confirmView()
 	}
+	if m.mode == modeAsk {
+		return m.askView()
+	}
 	var b strings.Builder
 	if m.showSlash {
 		b.WriteString(m.slashMenuView())
@@ -1291,6 +1401,32 @@ func (m *tuiModel) confirmView() string {
 		stPrim.Render("(a)") + " yes + auto-accept    " +
 		stErr.Render("(n)") + " no"
 	return box.Render(content) + "\n" + q
+}
+
+func (m *tuiModel) askView() string {
+	w := m.width - 2
+	if w > 90 {
+		w = 90
+	}
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colPrimary).
+		Padding(0, 1).
+		Width(w)
+
+	var b strings.Builder
+	b.WriteString(stTitle.Render(m.askQ))
+	for i, opt := range m.askOpts {
+		b.WriteString("\n")
+		label := fmt.Sprintf("%d. %s", i+1, opt)
+		if i == m.askSel {
+			b.WriteString(stPrim.Render("› " + label))
+		} else {
+			b.WriteString("  " + stAccent.Render(label))
+		}
+	}
+	hint := stDim.Render("↑/↓ move · 1–9 pick · enter select · esc skip")
+	return box.Render(b.String()) + "\n  " + hint
 }
 
 func (m *tuiModel) renderAssistant(md string) string {
@@ -1628,13 +1764,19 @@ func tryPasteImage(pasted, work string) (Image, bool) {
 }
 
 func confirmTitle(name string) string {
-	switch name {
+	switch canonicalTool(name) {
 	case "run_command":
 		return "Run command"
 	case "write_file":
 		return "Write file"
 	case "edit_file":
 		return "Edit file"
+	case "delete":
+		return "Delete file"
+	case "rename":
+		return "Rename file"
+	case "import_github":
+		return "Import GitHub repo"
 	}
 	return name
 }
