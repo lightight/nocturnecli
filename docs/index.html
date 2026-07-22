@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Nocturne Code — a coding agent in your terminal</title>
+<meta name="description" content="Nocturne Code is a terminal coding agent powered by the Nocturne API. It reads and edits files, runs commands, and takes pasted images — from a single cross-platform binary." />
+<meta property="og:title" content="Nocturne Code — a coding agent in your terminal" />
+<meta property="og:description" content="Reads files, edits code, runs commands, takes pasted images. One curl command to install. macOS · Linux · Windows." />
+<meta property="og:type" content="website" />
+<meta name="theme-color" content="#0A0A0C" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cpath d='M64 12a40 40 0 1 0 24 72A44 44 0 0 1 64 12z' fill='%23D97757'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    /* night surface — near-black, faintly cool so the warm clay reads against it */
+    --bg:#0A0A0C;
+    --bg-2:#131316;
+    --panel:#141417;
+    --line:rgba(255,255,255,.10); --line-2:rgba(255,255,255,.19);
+    /* text — every value below clears 4.5:1 on --bg */
+    --ink:#EDEBE7;                  /* ~17:1  */
+    --muted:#A8A59E;                /* ~9:1   */
+    --faint:#8B8880;                /* ~6:1 — the text floor */
+    /* clay accent — lifted from the light theme's #C15F3C, which was tuned for
+       contrast against paper and goes muddy on black */
+    --clay:#E08A68;                 /* ~6.4:1 on --bg */
+    --clay-bright:#D97757;
+    --clay-deep:#A14A2F;
+    --clay-tint:rgba(217,119,87,.14);
+    /* terminal surface — sits just *above* the page black so the panel reads
+       as a raised object rather than a hole */
+    --night:#101014; --night-2:#1A1A1F;
+    --night-ink:#E8E6E3; --night-muted:#B0AEA5; --night-faint:#8F8D85;
+    /* type — Claude stack: serif display, humanist sans body, mono code */
+    --serif:"Tiempos Headline","Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+    --sans:"Styrene A","Styrene B",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:"GT America Mono","JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    /* z-scale */
+    --z-nav:50;
+    /* easing */
+    --ease:cubic-bezier(.22,1,.36,1);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    font-size:17px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden;
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+  :focus-visible{outline:2px solid var(--clay-bright);outline-offset:3px;border-radius:4px}
+
+  /* ── nav ───────────────────────────── */
+  nav{
+    position:sticky;top:0;z-index:var(--z-nav);backdrop-filter:blur(12px);
+    background:rgba(10,10,12,.72);border-bottom:1px solid var(--line);
+  }
+  .nav-in{display:flex;align-items:center;justify-content:space-between;height:62px}
+  .brand{display:flex;align-items:center;gap:10px;font-family:var(--serif);font-weight:600;font-size:20px;letter-spacing:-.01em}
+  .brand .moon{width:20px;height:20px;animation:brandGlow 7.5s ease-in-out infinite}
+  @keyframes brandGlow{
+    0%,100%{filter:drop-shadow(0 0 3px rgba(217,119,87,.30))}
+    50%    {filter:drop-shadow(0 0 8px rgba(217,119,87,.58))}
+  }
+  .nav-links{display:flex;align-items:center;gap:30px;font-size:14.5px;color:var(--muted)}
+  .nav-links a{transition:color .15s}
+  .nav-links a:hover{color:var(--ink)}
+  .nav-cta{
+    background:var(--ink);color:var(--bg);padding:8px 16px;border-radius:8px;
+    font-weight:500;font-size:14px;transition:background .15s;
+  }
+  .nav-cta:hover{background:#FFFFFF;color:var(--bg)}
+  @media(max-width:680px){.nav-links a:not(.nav-cta){display:none}}
+
+  /* ── hero (lives inside the orbit finale — the scroll lands the full,
+     zoomed moon, then this copy fades in beneath it) ──────────────── */
+  h1{
+    font-family:var(--serif);font-weight:500;
+    font-size:clamp(42px,6.6vw,68px);line-height:1.06;letter-spacing:-.02em;margin:0 0 20px;
+    text-wrap:balance;
+  }
+  h1 .lit{font-style:italic;color:var(--clay);animation:litGlow 7.5s ease-in-out infinite}
+  @keyframes litGlow{                 /* breathes on the same clock as the moon */
+    0%,100%{text-shadow:0 0 0 rgba(217,119,87,0)}
+    50%    {text-shadow:0 0 24px rgba(217,119,87,.30)}
+  }
+  .sub{font-size:clamp(17px,2.2vw,20px);color:var(--muted);max-width:600px;margin:0 auto;line-height:1.6;text-wrap:pretty}
+
+  /* hero CTA */
+  .cta{display:flex;gap:13px;justify-content:center;flex-wrap:wrap;align-items:center;margin-top:28px}
+  .btn{
+    display:inline-flex;align-items:center;gap:9px;font-family:var(--sans);font-weight:500;font-size:15px;
+    padding:12px 22px;border-radius:9px;transition:transform .16s var(--ease),box-shadow .16s var(--ease),border-color .16s,background .16s;
+    border:1px solid transparent;cursor:pointer
+  }
+  .btn-primary{background:var(--ink);color:var(--bg);
+    box-shadow:0 0 30px -8px rgba(237,235,231,.28)}
+  .btn-primary:hover{background:#FFFFFF;transform:translateY(-1px);box-shadow:0 0 38px -6px rgba(237,235,231,.42)}
+  .btn-ghost{border-color:var(--line-2);color:var(--ink);background:transparent}
+  .btn-ghost:hover{border-color:var(--clay-bright);background:var(--clay-tint)}
+  .meta-line{margin:18px auto 0;font:500 13px var(--mono);color:var(--faint);letter-spacing:.01em}
+
+  /* ── sections ──────────────────────── */
+  section{padding:88px 0}
+  h2{
+    font-family:var(--serif);font-weight:500;
+    font-size:clamp(30px,3.8vw,42px);letter-spacing:-.015em;margin:0 0 14px;line-height:1.12;text-wrap:balance}
+  .lead{color:var(--muted);max-width:60ch;font-size:17px;line-height:1.65}
+
+  /* capabilities — deliberately unequal, no card grid, no emoji */
+  .cap-in{display:grid;grid-template-columns:.85fr 1.15fr;gap:clamp(28px,5vw,64px);align-items:start}
+  @media(max-width:820px){.cap-in{grid-template-columns:1fr;gap:30px}}
+  .cap-list{display:grid;grid-template-columns:1fr 1fr;gap:0;margin:0;border-top:1px solid var(--line)}
+  .cap-item{padding:20px 0;border-bottom:1px solid var(--line)}
+  .cap-item:nth-child(odd){padding-right:26px;border-right:1px solid var(--line)}
+  .cap-item:nth-child(even){padding-left:26px}
+  .cap-item--wide{grid-column:1 / -1;border-right:0!important;padding-right:0!important}
+  .cap-item dt{font-weight:600;font-size:16.5px;color:var(--ink);margin-bottom:5px;display:flex;align-items:baseline;gap:9px}
+  .cap-item dt::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--clay-bright);transform:translateY(-2px);flex:none}
+  .cap-item--wide dt{font-size:19px}
+  .cap-item dd{margin:0;color:var(--muted);font-size:15px;line-height:1.55}
+  @media(max-width:480px){
+    .cap-list{grid-template-columns:1fr}
+    .cap-item,.cap-item:nth-child(odd){padding:18px 0;border-right:0}
+    .cap-item:nth-child(even){padding-left:0}
+  }
+
+  /* install */
+  .tabs{display:flex;gap:8px;margin:26px 0 14px;flex-wrap:wrap}
+  .tab{
+    font:500 14px var(--sans);color:var(--muted);padding:8px 16px;border-radius:8px;
+    border:1px solid var(--line);background:var(--panel);cursor:pointer;transition:.15s
+  }
+  .tab:hover{color:var(--ink)}
+  .tab.active{color:var(--bg);background:var(--ink);border-color:var(--ink)}
+  .codeblk{
+    position:relative;background:var(--night);border:1px solid rgba(255,255,255,.09);border-radius:12px;
+    padding:17px 56px 17px 18px;font:14px/1.7 var(--mono);color:var(--night-ink);overflow-x:auto
+  }
+  .codeblk + .codeblk{margin-top:14px}
+  .codeblk .pmt{color:var(--clay-bright);user-select:none}
+  .codeblk .cmt{color:var(--night-faint)}
+  .copy{
+    position:absolute;top:9px;right:9px;border:1px solid rgba(255,255,255,.18);background:var(--night-2);
+    color:var(--night-muted);border-radius:7px;padding:6px 11px;font:500 12px var(--sans);cursor:pointer;transition:.15s
+  }
+  .copy:hover{color:var(--night-ink);border-color:var(--clay-bright)}
+  .copy.ok{color:#7FB285;border-color:#7FB285}
+  .copy.err{color:#D98E8E;border-color:#D98E8E}
+  .install-note{margin-top:16px;color:var(--muted);font-size:15px}
+  .install-note code,.lead code{background:var(--bg-2);border:1px solid var(--line);border-radius:6px;
+    padding:1px 7px;font:13px var(--mono);color:var(--clay)}
+
+  /* models — same shell as the commands table, plus a capability-tag column */
+  .models{margin-top:30px;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--panel)}
+  .model-row{display:grid;grid-template-columns:212px 1fr auto;gap:16px;padding:14px 20px;
+    border-bottom:1px solid var(--line);font-size:15px;align-items:center}
+  .model-row:last-child{border-bottom:0}
+  .model-row:nth-child(odd){background:rgba(255,255,255,.025)}
+  .model-row code{font:13.5px var(--mono);color:var(--clay);overflow-wrap:anywhere}
+  .model-row .who{color:var(--muted)}
+  .model-row .who b{color:var(--ink);font-weight:600}
+  .tags{display:flex;gap:6px;flex-wrap:wrap;justify-self:end}
+  .tag{font:500 11.5px/1 var(--mono);letter-spacing:.03em;padding:5px 9px;border-radius:999px;
+    border:1px solid var(--line-2);color:var(--faint);white-space:nowrap}
+  .tag--default{color:var(--clay);border-color:rgba(224,138,104,.45)}
+  .tag--reason{color:#C9A227;border-color:rgba(201,162,39,.42)}
+  .tag--vision{color:#8FA8C9;border-color:rgba(143,168,201,.42)}
+  @media(max-width:640px){
+    .model-row{grid-template-columns:1fr;gap:7px;align-items:start}
+    .tags{justify-self:start}
+  }
+
+  /* commands table */
+  .cmds{margin-top:30px;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--panel)}
+  .cmd-row{display:grid;grid-template-columns:210px 1fr;gap:16px;padding:13px 20px;border-bottom:1px solid var(--line);
+    font-size:15px;align-items:baseline}
+  .cmd-row:last-child{border-bottom:0}
+  .cmd-row:nth-child(odd){background:rgba(255,255,255,.025)}
+  .cmd-row code{font:13.5px var(--mono);color:var(--clay)}
+  .cmd-row span{color:var(--muted)}
+  @media(max-width:560px){.cmd-row{grid-template-columns:1fr;gap:3px}}
+
+  /* how it works — a real ordered sequence (numbers earned) */
+  .flow{list-style:none;margin:36px 0 0;padding:0;display:grid;grid-template-columns:repeat(4,1fr);gap:14px;counter-reset:step}
+  @media(max-width:720px){.flow{grid-template-columns:1fr 1fr}}
+  @media(max-width:440px){.flow{grid-template-columns:1fr}}
+  .flow li{position:relative;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;padding:18px 16px 16px;counter-increment:step}
+  .flow li::before{content:counter(step,decimal-leading-zero);font:600 12px var(--mono);color:var(--clay);display:block;margin-bottom:9px;letter-spacing:.05em}
+  .flow b{display:block;font-size:15.5px;font-weight:600;margin-bottom:3px}
+  .flow small{color:var(--muted);font-family:var(--mono);font-size:12.5px}
+
+  /* footer */
+  footer{border-top:1px solid var(--line);padding:40px 0;color:var(--faint);font-size:15px}
+  .foot-in{display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap}
+  .foot-links{display:flex;gap:24px}
+  .foot-links a{color:var(--muted)}
+  .foot-links a:hover{color:var(--ink)}
+
+  /* ── scroll progress bar ───────────── */
+  .scroll-progress{
+    position:fixed;top:0;left:0;right:0;height:2px;z-index:calc(var(--z-nav) + 1);
+    transform:scaleX(0);transform-origin:0 50%;will-change:transform;
+    background:var(--clay-bright);
+  }
+
+  /* ── lunar atmosphere ─────────────────
+     A moonlit layer fixed behind the entire page: two slow washes drifting
+     past each other, a field of floating motes, and a few clay sparkles.
+     Transform/opacity only, and the motes are only added to the DOM when
+     motion is allowed. A negative z-index parks it behind every section —
+     the body's background propagates to the canvas, so it stays visible. */
+  /* The layer is promoted to its own compositor plane (translateZ(0)) and the
+     washes use NO blur filter: a filter on a large fixed element is repainted
+     in tiles on scroll, and Safari lets those tiles show as blocky rectangles
+     — the softness is baked into the gradient stops instead. */
+  .sky{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;transform:translateZ(0)}
+  .sky::before,.sky::after{content:"";position:absolute;border-radius:50%}
+  .sky::before{                        /* warm clay — the moon's own light */
+    width:80%;height:64%;left:10%;top:-12%;
+    background:radial-gradient(circle at 50% 50%, rgba(217,119,87,.16) 0%, rgba(217,119,87,.07) 45%, transparent 70%);
+    animation:washA 34s ease-in-out infinite alternate;
+  }
+  .sky::after{                         /* a cool counterweight — deep-sky blue */
+    width:66%;height:60%;right:-4%;top:16%;
+    background:radial-gradient(circle at 50% 50%, rgba(96,116,178,.16) 0%, rgba(96,116,178,.06) 45%, transparent 72%);
+    animation:washB 47s ease-in-out infinite alternate;
+  }
+  @keyframes washA{from{transform:translate3d(-4%,0,0) scale(1)}   to{transform:translate3d(7%,5%,0) scale(1.14)}}
+  @keyframes washB{from{transform:translate3d(5%,3%,0) scale(1.08)}to{transform:translate3d(-6%,-4%,0) scale(.94)}}
+
+  .stars{position:absolute;inset:0}
+  /* Each mote drifts on a long alternating path and twinkles on a shorter one;
+     both delays are negative so the field is already mid-cycle on first paint. */
+  .star{
+    position:absolute;border-radius:50%;background:currentColor;
+    animation:starDrift var(--drift) ease-in-out infinite alternate,
+              starTwinkle var(--twinkle) ease-in-out infinite;
+    animation-delay:var(--d1),var(--d2);
+  }
+  /* Brighter stars carry a halo; the faint majority stay bare dots, which is
+     what keeps the field reading as depth rather than as noise. */
+  .star--bright{box-shadow:0 0 7px 1px currentColor}
+  .star--clay{color:var(--clay-bright);box-shadow:0 0 8px 1px currentColor}
+  @keyframes starDrift{from{transform:translate3d(0,0,0)}to{transform:translate3d(var(--dx),var(--dy),0)}}
+  @keyframes starTwinkle{0%,100%{opacity:var(--o)}50%{opacity:calc(var(--o) * .2)}}
+
+  /* four-point sparkle — two crossed hairlines on a zero-size anchor */
+  .spark{
+    position:absolute;color:var(--clay-bright);
+    animation:sparkTurn var(--drift) linear infinite,
+              starTwinkle var(--twinkle) ease-in-out infinite;
+    animation-delay:var(--d1),var(--d2);
+  }
+  .spark::before,.spark::after{content:"";position:absolute;left:0;top:0;background:currentColor;
+    border-radius:2px;transform:translate(-50%,-50%)}
+  .spark::before{width:var(--s);height:1.5px}
+  .spark::after{width:1.5px;height:var(--s)}
+  @keyframes sparkTurn{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+
+  /* ── orbit: the scroll-driven lunar pass ──
+     An Apple-style pinned scene that opens the page: the section is several
+     viewports tall, its stage sticks, and scroll position scrubs the moon
+     from a new-moon sliver to full and zoomed in, while captions cycle
+     underneath. The finale is the hero itself — headline, copy, and CTAs
+     fade in once the moon is full.
+     Base styles are the no-JS / reduced-motion fallback — an ordinary,
+     fully-visible stacked section showing the moon already full. The pinned
+     behaviour only exists under .reveal-on (set pre-paint by the head script
+     when motion is allowed), so the fallback never flashes. */
+  .orbit{padding:0}
+  .orbit-pin{position:relative;padding:110px 0;text-align:center}
+  .orbit-sky{display:none}
+  .orbit-moon-pos{display:block}
+  .orbit-moon{width:clamp(210px,26vw,320px);height:auto;display:block;overflow:visible;margin:0 auto 40px}
+  .orbit-shadow{transform-box:view-box;transform:translateX(-280px)}  /* parked off-disc: full moon */
+  .orbit-caps{display:grid;gap:30px;justify-items:center}
+  .ocap{
+    font-family:var(--serif);font-weight:500;
+    font-size:clamp(30px,4.6vw,52px);letter-spacing:-.02em;line-height:1.15;
+    margin:0;max-width:840px;padding:0 24px;text-wrap:balance;
+  }
+  .ocap .lit{font-style:italic;color:var(--clay)}
+  /* the finale is the hero: headline + copy + CTAs, a touch smaller than the
+     global h1 scale so it shares the stage with the full, zoomed moon */
+  .ocap--hero h1{font-size:clamp(34px,5vw,58px);margin:0 0 16px}
+  .ocap--hero .cta{margin-top:24px}
+  .ocap--hero .meta-line{margin-top:16px}
+  .orbit-cue{display:none}
+
+  .reveal-on .orbit{height:430vh}
+  .reveal-on .orbit-pin{
+    position:sticky;top:0;height:100vh;padding:0;overflow:hidden;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .reveal-on .orbit-sky{display:block;position:absolute;inset:0;overflow:hidden;pointer-events:none}
+  .reveal-on .orbit-moon-pos{position:absolute;left:50%;top:34%;transform:translate(-50%,-50%)}
+  .reveal-on .orbit-moon{margin:0;will-change:transform}
+  @media(max-height:620px){
+    .reveal-on .orbit-moon{width:clamp(160px,24vw,230px)}
+    .reveal-on .ocap--hero h1{font-size:clamp(26px,4vw,38px);margin-bottom:10px}
+    .reveal-on .ocap--hero .sub{font-size:15px}
+    .reveal-on .ocap--hero .cta{margin-top:14px}
+    .reveal-on .ocap--hero .meta-line{display:none}
+  }
+  .reveal-on .ocap{
+    position:absolute;left:0;right:0;bottom:9vh;margin:0 auto;
+    opacity:0;pointer-events:none;will-change:transform,opacity;
+  }
+  .reveal-on .ocap a,.reveal-on .ocap button{pointer-events:auto}
+  /* the finale is taller than the one-line captions — park it lower so it
+     clears the full moon above it */
+  .reveal-on .ocap--hero{bottom:4.5vh}
+  .reveal-on .orbit-cue{
+    display:flex;position:absolute;left:0;right:0;bottom:4vh;
+    flex-direction:column;align-items:center;gap:9px;
+    font:500 11px var(--mono);letter-spacing:.28em;text-transform:uppercase;color:var(--faint);
+  }
+  .orbit-cue i{width:1px;height:26px;background:linear-gradient(var(--faint),transparent);animation:cueDrop 1.9s var(--ease) infinite}
+  @keyframes cueDrop{
+    0%{transform:scaleY(0);transform-origin:top}
+    45%{transform:scaleY(1);transform-origin:top}
+    55%{transform:scaleY(1);transform-origin:bottom}
+    100%{transform:scaleY(0);transform-origin:bottom}
+  }
+
+  /* ── scroll reveal (progressive enhancement) ──
+     Hidden state only applies once .reveal-on is set (JS, motion allowed),
+     so no-JS and reduced-motion users always see the full page. */
+  .reveal-on .reveal{
+    opacity:0;transform:translateY(24px);
+    transition:opacity .7s var(--ease),transform .7s var(--ease);
+  }
+  .reveal-on .reveal.in{opacity:1;transform:none}
+
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto}
+    *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+    .reveal{opacity:1!important;transform:none!important}
+  }
+</style>
+<script>
+  /* Flip on reveal hiding before paint (only when motion is allowed),
+     so revealed elements never flash visible-then-hidden. */
+  try{ if(!matchMedia('(prefers-reduced-motion: reduce)').matches) document.documentElement.classList.add('reveal-on'); }catch(e){}
+</script>
+</head>
+<body>
+
+<div class="scroll-progress" aria-hidden="true"></div>
+
+<div class="sky" aria-hidden="true">
+  <div class="stars" data-stars></div>
+</div>
+
+<nav>
+  <div class="wrap nav-in">
+    <a class="brand" href="#top">
+      <svg class="moon" viewBox="0 0 100 100" aria-hidden="true"><path d="M62 8a42 42 0 1 0 26 76A46 46 0 0 1 62 8z" fill="#D97757"/></svg>
+      Nocturne Code
+    </a>
+    <div class="nav-links">
+      <a href="#features">What it does</a>
+      <a href="#install">Install</a>
+      <a href="#models">Models</a>
+      <a href="#commands">Commands</a>
+      <a class="nav-cta" href="https://github.com/lightight/nocturnecli">GitHub ↗</a>
+    </div>
+  </div>
+</nav>
+
+<a id="top"></a>
+<section id="orbit" class="orbit">
+  <div class="orbit-pin">
+    <div class="orbit-sky" aria-hidden="true" data-orbit-stars></div>
+    <div class="orbit-moon-pos">
+      <svg class="orbit-moon" viewBox="0 0 200 200" aria-hidden="true">
+        <defs>
+          <radialGradient id="omBody" cx="37%" cy="30%" r="74%">
+            <stop offset="0%"   stop-color="#F2A986"/>
+            <stop offset="52%"  stop-color="#D97757"/>
+            <stop offset="100%" stop-color="#B4563A"/>
+          </radialGradient>
+          <radialGradient id="omLimb" cx="34%" cy="27%" r="80%">
+            <stop offset="48%"  stop-color="#5A2517" stop-opacity="0"/>
+            <stop offset="100%" stop-color="#3F1A10" stop-opacity=".62"/>
+          </radialGradient>
+          <radialGradient id="omHalo" cx="50%" cy="50%" r="50%">
+            <stop offset="50%"  stop-color="#E8A184" stop-opacity=".26"/>
+            <stop offset="64%"  stop-color="#D97757" stop-opacity=".13"/>
+            <stop offset="100%" stop-color="#D97757" stop-opacity="0"/>
+          </radialGradient>
+          <!-- the travelling terminator: a soft-edged night disc the scroll
+               sweeps off the face, waxing the moon from crescent to full -->
+          <radialGradient id="omShade" cx="50%" cy="50%" r="50%">
+            <stop offset="0%"   stop-color="#06060A" stop-opacity=".97"/>
+            <stop offset="62%"  stop-color="#06060A" stop-opacity=".97"/>
+            <stop offset="88%"  stop-color="#06060A" stop-opacity=".55"/>
+            <stop offset="100%" stop-color="#06060A" stop-opacity="0"/>
+          </radialGradient>
+          <clipPath id="omClip"><circle cx="100" cy="100" r="62"/></clipPath>
+        </defs>
+        <circle class="orbit-halo" cx="100" cy="100" r="97" fill="url(#omHalo)"/>
+        <circle cx="100" cy="100" r="62" fill="url(#omBody)"/>
+        <g clip-path="url(#omClip)" fill="#BE5E3E">
+          <circle cx="78"  cy="74"  r="15" opacity=".34"/>
+          <circle cx="119" cy="121" r="11" opacity=".30"/>
+          <circle cx="86"  cy="125" r="7"  opacity=".26"/>
+          <circle cx="125" cy="82"  r="6"  opacity=".28"/>
+          <circle cx="65"  cy="105" r="5"  opacity=".22"/>
+          <circle cx="105" cy="61"  r="4.5" opacity=".24"/>
+          <circle cx="141" cy="103" r="4"  opacity=".20"/>
+          <circle cx="97"  cy="95"  r="3"  opacity=".18"/>
+        </g>
+        <circle cx="100" cy="100" r="62" fill="url(#omLimb)"/>
+        <g clip-path="url(#omClip)">
+          <circle class="orbit-shadow" cx="100" cy="100" r="72" fill="url(#omShade)"/>
+        </g>
+      </svg>
+    </div>
+    <div class="orbit-caps">
+      <div class="ocap">Reads your files.</div>
+      <div class="ocap">Edits with intent.</div>
+      <div class="ocap">Runs it for real.</div>
+      <div class="ocap ocap--hero">
+        <h1>A coding agent in your <span class="lit">terminal</span>.</h1>
+        <p class="sub">Nocturne Code reads your files, edits code, runs commands, and takes pasted images — an agentic CLI powered by the Nocturne API.</p>
+        <div class="cta">
+          <button class="btn btn-primary" type="button"
+            data-copy="curl -fsSL https://nocturnecode.lol/install.sh | sh">
+            Copy install command
+          </button>
+          <a class="btn btn-ghost" href="https://github.com/lightight/nocturnecli">Star on GitHub</a>
+        </div>
+        <p class="meta-line">MIT · single binary · macOS · Linux · Windows · amd64 + arm64</p>
+      </div>
+    </div>
+    <div class="orbit-cue" aria-hidden="true"><span>scroll</span><i></i></div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap cap-in">
+    <div class="cap-lead reveal">
+      <h2>Not a chatbot. A working toolchain.</h2>
+      <p class="lead">Nocturne Code drives a real toolset against your project and feeds the actual results back into the conversation. No hallucinated output, no copy-paste relay.</p>
+    </div>
+    <dl class="cap-list" data-stagger>
+      <div class="reveal cap-item cap-item--wide">
+        <dt>Reads &amp; edits your files</dt>
+        <dd>Opens files, makes precise targeted edits, and writes new ones, with every change shown as a diff-style confirmation before anything touches disk.</dd>
+      </div>
+      <div class="reveal cap-item">
+        <dt>Runs commands</dt>
+        <dd>Executes in your working directory and feeds the real output back.</dd>
+      </div>
+      <div class="reveal cap-item">
+        <dt>Searches the codebase</dt>
+        <dd>Regex search and directory listing, so it learns structure first.</dd>
+      </div>
+      <div class="reveal cap-item">
+        <dt>Takes pasted images</dt>
+        <dd>Ctrl+V a screenshot, or reference an image path inline.</dd>
+      </div>
+      <div class="reveal cap-item">
+        <dt>One static binary</dt>
+        <dd>macOS, Linux, and Windows, on amd64 and arm64. No runtime to install.</dd>
+      </div>
+    </dl>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap" data-stagger>
+    <h2 class="reveal">One command away</h2>
+    <p class="lead reveal">Pick your platform. The installer fetches a prebuilt binary and falls back to building from source if you have Go.</p>
+
+    <div class="tabs reveal" role="tablist" aria-label="Install method">
+      <button class="tab active" type="button" data-os="mac" role="tab" aria-selected="true">macOS / Linux</button>
+      <button class="tab" type="button" data-os="win" role="tab" aria-selected="false">Windows</button>
+      <button class="tab" type="button" data-os="src" role="tab" aria-selected="false">From source</button>
+    </div>
+
+    <div class="codeblk reveal" data-panel="mac">
+      <button class="copy" type="button" data-copy-block>Copy</button>
+<span class="pmt">$</span> curl -fsSL https://nocturnecode.lol/install.sh | sh</div>
+
+    <div class="codeblk reveal" data-panel="win" hidden>
+      <button class="copy" type="button" data-copy-block>Copy</button>
+<span class="pmt">PS&gt;</span> irm https://nocturnecode.lol/install.ps1 | iex</div>
+
+    <div class="codeblk reveal" data-panel="src" hidden>
+      <button class="copy" type="button" data-copy-block>Copy</button>
+<span class="pmt">$</span> git clone https://github.com/lightight/nocturnecli &amp;&amp; cd nocturnecli
+<span class="pmt">$</span> make install   <span class="cmt"># → ~/.local/bin/nocturne</span></div>
+
+    <p class="install-note reveal">Then launch it. No environment variables to set:</p>
+    <div class="codeblk reveal">
+      <button class="copy" type="button" data-copy-block>Copy</button>
+<span class="pmt">$</span> nocturne</div>
+    <p class="install-note reveal">Inside the app, run <code>/key noct_your_key</code> once. Your key is saved privately on your machine (<code>~/.config/nocturne</code>) and reused for every project, with no <code>export</code> and no per-folder <code>.env</code>.</p>
+    <p class="install-note reveal">Default model is <code>navy:gpt-5.5</code> — see <a href="#models" style="color:var(--clay);text-decoration:underline;text-underline-offset:3px">the models it knows</a>.</p>
+  </div>
+</section>
+
+<section id="models">
+  <div class="wrap" data-stagger>
+    <h2 class="reveal">Models</h2>
+    <p class="lead reveal">Every model currently served by the Nocturne API. Your account's real list comes from the API itself — open the picker with <code>/model</code>, or run <code>nocturne models</code> from the shell.</p>
+    <div class="models reveal">
+      <div class="model-row">
+        <code>navy:gpt-5.5</code><span class="who"><b>GPT-5.5</b> · OpenAI</span>
+        <span class="tags"><span class="tag tag--default">default</span><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:claude-haiku-4.5</code><span class="who"><b>Claude Haiku 4.5</b> · Anthropic</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:gpt-5.4-mini</code><span class="who"><b>GPT-5.4 Mini</b> · OpenAI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:gemini-3.5-flash</code><span class="who"><b>Gemini 3.5 Flash</b> · Google</span>
+        <span class="tags"><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:gemini-3.1-pro-preview</code><span class="who"><b>Gemini 3.1 Pro</b> (Preview) · Google</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:gpt-4o</code><span class="who"><b>GPT-4o</b> · OpenAI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:gpt-4o-mini-search-preview</code><span class="who"><b>GPT-4o mini Search</b> (Preview) · OpenAI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:grok-4.3</code><span class="who"><b>Grok 4.3</b> · xAI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:grok-4.1-fast-reasoning</code><span class="who"><b>Grok 4.1 Fast</b> · xAI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:deepseek-v4-pro</code><span class="who"><b>DeepSeek V4 Pro</b> · DeepSeek</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:kimi-k2.6</code><span class="who"><b>Kimi K2.6</b> · Moonshot AI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:kimi-k2.5</code><span class="who"><b>Kimi K2.5</b> · Moonshot AI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:qwen3.5-397b-a17b</code><span class="who"><b>Qwen3.5 397B A17B</b> · Alibaba</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:mistral-medium-3.5</code><span class="who"><b>Mistral Medium 3.5</b> · Mistral</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:mistral-medium-latest</code><span class="who"><b>Mistral Medium</b> · Mistral</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:llama-4-scout</code><span class="who"><b>Llama 4 Scout</b> · Meta</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:nemotron-3-super</code><span class="who"><b>Nemotron 3 Super</b> · NVIDIA</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:mimo-v2.5-pro</code><span class="who"><b>MiMo V2.5 Pro</b> · Xiaomi</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:hermes-4-405b</code><span class="who"><b>Hermes 4 405B</b> · Nous Research</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>navy:c4ai-aya-expanse-32b</code><span class="who"><b>Aya Expanse 32B</b> · Cohere</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>openai/gpt-oss-120b</code><span class="who"><b>GPT-OSS 120B</b> · OpenAI</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>llama-3.3-70b-versatile</code><span class="who"><b>Llama 3.3 70B</b> · Meta</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+      <div class="model-row">
+        <code>meta-llama/llama-4-scout-17b-16e-instruct</code><span class="who"><b>Llama 4 Scout 17B</b> · Meta</span>
+        <span class="tags"><span class="tag tag--vision">vision</span></span>
+      </div>
+      <div class="model-row">
+        <code>qwen/qwen3-32b</code><span class="who"><b>Qwen3 32B</b> · Alibaba</span>
+        <span class="tags"><span class="tag tag--reason">reasoning</span></span>
+      </div>
+    </div>
+    <p class="install-note reveal">Only a <span style="color:var(--ink)">vision</span> model sees an image directly. On the rest the image still attaches — Nocturne has a vision model describe it first, preferring <code>navy:claude-haiku-4.5</code>, then sends that description along as text.</p>
+    <p class="install-note reveal">Model access is per-account, so use an id you've been granted. Switch any time with <code>/model &lt;id&gt;</code>, or <code>-m</code> on the command line for a single run.</p>
+  </div>
+</section>
+
+<section id="commands">
+  <div class="wrap" data-stagger>
+    <h2 class="reveal">Slash commands</h2>
+    <p class="lead reveal">Everything you need without leaving the prompt.</p>
+    <div class="cmds reveal">
+      <div class="cmd-row"><code>/help</code><span>Show every command.</span></div>
+      <div class="cmd-row"><code>/model [id]</code><span>Pick a model from a list, or set one by id.</span></div>
+      <div class="cmd-row"><code>/level</code><span>Thinking effort: off, normal, or extended.</span></div>
+      <div class="cmd-row"><code>/permissions</code><span>How tool actions get approved: ask, auto, or bypass.</span></div>
+      <div class="cmd-row"><code>/key [noct_…]</code><span>Save your API key privately, remembered across every project.</span></div>
+      <div class="cmd-row"><code>/image &lt;path&gt;</code><span>Attach an image (a file path, or Ctrl+V from the clipboard).</span></div>
+      <div class="cmd-row"><code>/mouse</code><span>Capture the mouse for wheel scrolling; off keeps native text selection.</span></div>
+      <div class="cmd-row"><code>/cd &lt;dir&gt;</code><span>Change the working directory.</span></div>
+      <div class="cmd-row"><code>/usage</code><span>Usage dashboard — status, usage &amp; stats.</span></div>
+      <div class="cmd-row"><code>/cowork</code><span>Computer use — let it see and control this computer.</span></div>
+      <div class="cmd-row"><code>/compact</code><span>Summarize the conversation to free up context.</span></div>
+      <div class="cmd-row"><code>/resume</code><span>Resume a saved chat from this directory.</span></div>
+      <div class="cmd-row"><code>/new</code><span>Start a new chat.</span></div>
+      <div class="cmd-row"><code>/remote</code><span>Control this session from your browser, paired &amp; end-to-end encrypted.</span></div>
+      <div class="cmd-row"><code>/clear</code><span>Clear the conversation.</span></div>
+      <div class="cmd-row"><code>/init</code><span>Generate a NOCTURNE.md for the project.</span></div>
+      <div class="cmd-row"><code>/update</code><span>Update Nocturne Code to the latest release.</span></div>
+      <div class="cmd-row"><code>/exit</code><span>Quit.</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap" data-stagger>
+    <h2 class="reveal">A clean agent loop</h2>
+    <p class="lead reveal">The model asks for a tool, Nocturne Code runs it for real, and the result flows back, looping until the task is done.</p>
+    <ol class="flow">
+      <li class="reveal"><b>You ask</b><small>natural language</small></li>
+      <li class="reveal"><b>Model calls a tool</b><small>read · edit · run</small></li>
+      <li class="reveal"><b>Nocturne Code executes</b><small>on your machine</small></li>
+      <li class="reveal"><b>Result loops back</b><small>until finished</small></li>
+    </ol>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-in">
+    <div class="brand" style="font-size:17px">
+      <svg class="moon" viewBox="0 0 100 100" aria-hidden="true"><path d="M62 8a42 42 0 1 0 26 76A46 46 0 0 1 62 8z" fill="#D97757"/></svg>
+      Nocturne Code <span style="color:var(--faint);font-weight:400;font-family:var(--sans);font-size:14px">· MIT Licensed</span>
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/lightight/nocturnecli">GitHub</a>
+      <a href="https://nocturne.lol">Nocturne API</a>
+      <a href="#top">Back to top ↑</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  /* ---- clipboard with a real failure path (no silent no-op) ---- */
+  function setState(btn, cls, label, ms){
+    const prev = btn.dataset.label || btn.textContent;
+    btn.dataset.label = prev;
+    btn.classList.add(cls);
+    if (label != null) btn.textContent = label;
+    setTimeout(() => { btn.classList.remove(cls); if (label != null) btn.textContent = prev; delete btn.dataset.label; }, ms);
+  }
+  async function copy(text, btn, okLabel){
+    try{
+      if (navigator.clipboard && window.isSecureContext){
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        const ok = document.execCommand('copy'); document.body.removeChild(ta);
+        if (!ok) throw new Error('execCommand failed');
+      }
+      setState(btn, 'ok', okLabel ?? '✓ Copied', 1500);
+    }catch(_){
+      setState(btn, 'err', 'Press ' + (navigator.platform.indexOf('Mac')>-1 ? '⌘C' : 'Ctrl+C'), 2200);
+    }
+  }
+  document.querySelector('[data-copy]')?.addEventListener('click', e => {
+    const b = e.currentTarget; copy(b.dataset.copy, b, '✓ Copied install command');
+  });
+  document.querySelectorAll('[data-copy-block]').forEach(btn => btn.addEventListener('click', () => {
+    const blk = btn.parentElement.cloneNode(true);
+    blk.querySelector('.copy')?.remove();
+    const text = blk.textContent.replace(/^\s*(\$|PS>)\s?/gm, '').trim();
+    copy(text, btn, '✓ Copied');
+  }));
+
+  /* ---- install tabs ---- */
+  const tabs = document.querySelectorAll('.tab');
+  tabs.forEach(t => t.addEventListener('click', () => {
+    tabs.forEach(x => { x.classList.remove('active'); x.setAttribute('aria-selected','false'); });
+    t.classList.add('active'); t.setAttribute('aria-selected','true');
+    const os = t.dataset.os;
+    document.querySelectorAll('[data-panel]').forEach(p => p.hidden = (p.dataset.panel !== os));
+  }));
+
+  /* ---- lunar mote field ----
+     Motes and sparkles only enter the DOM when motion is allowed (.reveal-on is
+     set pre-paint by the head script), so reduced-motion visitors get a still
+     page with nothing extra in it. Positions come from a seeded generator, so
+     the field is identical on every load rather than reshuffling per visit.
+     Once placed, every mote animates purely in CSS — there's no frame loop. */
+  (function(){
+    const field = document.querySelector('[data-stars]');
+    if (!field || !document.documentElement.classList.contains('reveal-on')) return;
+
+    let seed = 0x4d6f6f6e;                                  // "Moon"
+    const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+    const at = (a, b) => a + rnd() * (b - a);
+
+    // Real starlight is mostly white, with a scatter of warm and cool giants.
+    const TINTS = ['#FFFFFF','#FFFFFF','#FFFFFF','#F4F8FF','#FFE9D2','#DCE6FF'];
+
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < 130; i++){
+      // The sky is fixed behind the whole page, so motes spread evenly over
+      // the viewport; panels and cards simply occlude whatever sits behind
+      // them. Ranges stay just inside 0–100% so nothing is sliced by the
+      // sky's clip.
+      const top = at(0, 100);
+      const left = at(2, 98);
+
+      const isSpark = i % 23 === 7;                          // a rare crossed sparkle
+      const size = at(1, 3.1);
+      const bright = size > 2.4;                             // only the big ones halo
+      const el = document.createElement('i');
+      el.className = isSpark ? 'spark'
+                   : 'star' + (bright ? ' star--bright' : '') + (i % 17 === 3 ? ' star--clay' : '');
+      const s = el.style;
+      s.left = left.toFixed(2) + '%';
+      s.top  = top.toFixed(2) + '%';
+
+      if (isSpark){
+        s.setProperty('--s', at(10, 17).toFixed(1) + 'px');
+      } else {
+        s.width = s.height = size.toFixed(1) + 'px';
+        if (i % 17 !== 3) s.color = TINTS[i % TINTS.length];
+      }
+      // Faint stars stay faint — the field needs that spread to read as depth.
+      s.setProperty('--o',  (bright ? at(.6, 1) : at(.16, .6)).toFixed(2));
+      s.setProperty('--dx', at(-34, 34).toFixed(0) + 'px');
+      s.setProperty('--dy', at(-30, 18).toFixed(0) + 'px');
+      s.setProperty('--drift',   at(26, 62).toFixed(1) + 's');
+      s.setProperty('--twinkle', at(3.5, 9).toFixed(1) + 's');
+      s.setProperty('--d1', '-' + at(0, 40).toFixed(1) + 's');   // negative: start mid-cycle
+      s.setProperty('--d2', '-' + at(0, 9).toFixed(1) + 's');
+      frag.appendChild(el);
+    }
+    field.appendChild(frag);
+  })();
+
+  /* ---- orbit: the scroll-scrubbed lunar pass ----
+     Scroll position drives the pinned scene: the moon rises and grows, a soft
+     night-shadow sweeps off its face (crescent → full), captions cycle
+     underneath on timed windows, and the star field parallaxes at per-star
+     depths. Transform/opacity only, rAF-throttled, and gated on .reveal-on —
+     no-JS and reduced-motion visitors keep the static stacked version and
+     never enter here. */
+  (function(){
+    const sec = document.querySelector('.orbit');
+    if (!sec || !document.documentElement.classList.contains('reveal-on')) return;
+    const moon   = sec.querySelector('.orbit-moon');
+    const shadow = sec.querySelector('.orbit-shadow');
+    const halo   = sec.querySelector('.orbit-halo');
+    const caps   = Array.from(sec.querySelectorAll('.ocap'));
+    const cue    = sec.querySelector('.orbit-cue');
+
+    const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+    const ss = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+    // caption windows: [fade-in start, fully in, fade-out start, gone].
+    // The finale's out-points sit past p=1, so once it lands it stays.
+    const WIN = [[.05,.12,.20,.27],[.30,.37,.45,.52],[.55,.62,.70,.77],[.80,.90,2,2.1]];
+
+    // Star field with per-star parallax depth: the outer span takes the scroll
+    // transform, the inner mote keeps its CSS drift/twinkle animations.
+    const sky = sec.querySelector('[data-orbit-stars]');
+    const stars = [];
+    if (sky){
+      let seed = 0x6f726269;                                // "orbi"
+      const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+      const at = (a, b) => a + rnd() * (b - a);
+      const TINTS = ['#FFFFFF','#FFFFFF','#F4F8FF','#FFE9D2','#DCE6FF'];
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < 46; i++){
+        const pos = document.createElement('span');
+        pos.style.cssText = 'position:absolute;left:' + at(2, 98).toFixed(2) + '%;top:' + at(2, 96).toFixed(2) + '%';
+        const st = document.createElement('i');
+        st.className = 'star' + (rnd() < .18 ? ' star--bright' : '');
+        const size = at(1, 2.6);
+        st.style.width = st.style.height = size.toFixed(1) + 'px';
+        st.style.color = TINTS[i % TINTS.length];
+        st.style.setProperty('--o', at(.14, .7).toFixed(2));
+        st.style.setProperty('--dx', at(-22, 22).toFixed(0) + 'px');
+        st.style.setProperty('--dy', at(-18, 12).toFixed(0) + 'px');
+        st.style.setProperty('--drift', at(28, 58).toFixed(1) + 's');
+        st.style.setProperty('--twinkle', at(3.5, 9).toFixed(1) + 's');
+        st.style.setProperty('--d1', '-' + at(0, 40).toFixed(1) + 's');
+        st.style.setProperty('--d2', '-' + at(0, 9).toFixed(1) + 's');
+        pos.appendChild(st);
+        frag.appendChild(pos);
+        stars.push({ el: pos, depth: at(30, 150) });
+      }
+      sky.appendChild(frag);
+    }
+
+    let ticking = false;
+    function render(){
+      ticking = false;
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      const rect = sec.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > vh) return;         // off screen — nothing to draw
+      const total = sec.offsetHeight - vh;
+      const p = clamp(-rect.top / total, 0, 1);
+
+      const phase = ss(0, .74, p);                          // crescent → full
+      const grow  = ss(0, .84, p);                          // rise + zoom
+      moon.style.transform = 'translateY(' + ((1 - grow) * 42).toFixed(1) + 'px) scale(' + (.55 + .6 * grow).toFixed(4) + ')';
+      shadow.style.transform = 'translateX(' + (-12 - 268 * phase).toFixed(1) + 'px)';
+      halo.style.opacity = (.45 + .55 * phase).toFixed(3);
+
+      for (let i = 0; i < caps.length; i++){
+        const w = WIN[i], a = ss(w[0], w[1], p), b = ss(w[2], w[3], p);
+        caps[i].style.opacity = (a * (1 - b)).toFixed(3);
+        caps[i].style.transform = 'translateY(' + ((1 - a) * 26 - b * 26).toFixed(1) + 'px)';
+      }
+      if (cue) cue.style.opacity = Math.max(0, 1 - p * 9).toFixed(3);
+      for (let i = 0; i < stars.length; i++)
+        stars[i].el.style.transform = 'translateY(' + (-p * stars[i].depth).toFixed(1) + 'px)';
+    }
+    function onScroll(){
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(render);
+    }
+    render();
+    addEventListener('scroll', onScroll, { passive: true });
+    addEventListener('resize', onScroll, { passive: true });
+  })();
+
+  /* ---- scroll progress bar (scroll-linked, rAF-throttled) ---- */
+  (function(){
+    const bar = document.querySelector('.scroll-progress');
+    if (!bar) return;
+    let ticking = false;
+    function update(){
+      const el = document.documentElement;
+      const max = el.scrollHeight - el.clientHeight;
+      const p = max > 0 ? Math.min(1, el.scrollTop / max) : 0;
+      bar.style.transform = 'scaleX(' + p + ')';
+      ticking = false;
+    }
+    addEventListener('scroll', () => { if (!ticking){ requestAnimationFrame(update); ticking = true; } }, { passive: true });
+    addEventListener('resize', update, { passive: true });
+    update();
+  })();
+
+  /* ---- reveal on scroll (progressive enhancement) ----
+     .reveal-on is set pre-paint by the head script when motion is allowed,
+     so no-JS / reduced-motion users keep the fully visible page. */
+  (function(){
+    if (!document.documentElement.classList.contains('reveal-on')) return;
+    const items = document.querySelectorAll('.reveal');
+    if (!items.length) return;
+
+    // stagger siblings inside any [data-stagger] group
+    document.querySelectorAll('[data-stagger]').forEach(group => {
+      group.querySelectorAll('.reveal').forEach((el, i) => {
+        el.style.transitionDelay = (i * 70) + 'ms';
+      });
+    });
+
+    if (!('IntersectionObserver' in window)){
+      items.forEach(el => el.classList.add('in'));
+      return;
+    }
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach(en => {
+        if (en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
+    items.forEach(el => io.observe(el));
+  })();
+</script>
+</body>
+</html>
