@@ -190,15 +190,27 @@ var fewShot = []wireMessage{
 	{Role: "assistant", Content: "Done — set `PORT` to 80 in `config.py`."},
 }
 
+const maxAPIMessages = 50
+
 func (c *Client) buildBody(system string, msgs []ChatMessage, stream, fewshot bool) ([]byte, error) {
-	var wire []wireMessage
-	if fewshot {
-		wire = append(wire, fewShot...)
-	}
-	wire = append(wire, c.toWire(msgs)...)
+	var prefix []wireMessage
 	if strings.TrimSpace(system) != "" {
-		wire = append([]wireMessage{{Role: "system", Content: system}}, wire...)
+		prefix = append(prefix, wireMessage{Role: "system", Content: system})
 	}
+	if fewshot {
+		prefix = append(prefix, fewShot...)
+	}
+
+	budget := maxAPIMessages - len(prefix)
+	history := c.toWire(msgs)
+	keptHistory := fitWireMessages(history, budget)
+	if len(history) > len(keptHistory) {
+		if dbg := os.Getenv("NOCTURNE_DEBUG"); dbg != "" {
+			appendDebug(dbg, "REQUEST(message-cap)", fmt.Sprintf("dropping %d old message(s); keeping %d history message(s) + %d prefix message(s) = %d total", len(history)-len(keptHistory), len(keptHistory), len(prefix), len(prefix)+len(keptHistory)))
+		}
+	}
+	wire := append([]wireMessage(nil), prefix...)
+	wire = append(wire, keptHistory...)
 	req := chatRequest{
 		Model:       c.cfg.Model,
 		Messages:    wire,
@@ -207,6 +219,16 @@ func (c *Client) buildBody(system string, msgs []ChatMessage, stream, fewshot bo
 		Temperature: c.cfg.Temperature,
 	}
 	return json.Marshal(req)
+}
+
+func fitWireMessages(msgs []wireMessage, budget int) []wireMessage {
+	if budget <= 0 {
+		return nil
+	}
+	if len(msgs) <= budget {
+		return msgs
+	}
+	return msgs[len(msgs)-budget:]
 }
 
 func (c *Client) newRequest(ctx context.Context, body []byte) (*http.Request, error) {

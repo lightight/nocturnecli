@@ -137,16 +137,6 @@ func renderUser(text string, nImages int) string {
 	return head + body
 }
 
-// stStack styles the "×N" badge shown when the same tool call repeats.
-var stStack = lipgloss.NewStyle().Foreground(lipgloss.Color("#1a1a22")).Background(colAccent).Bold(true)
-
-// stackBadge renders a small pill marking the Nth identical tool call, so a
-// model looping on the same call reads as a stack rather than a wall of
-// duplicate lines.
-func stackBadge(n int) string {
-	return stStack.Render(fmt.Sprintf(" ↻×%d ", n))
-}
-
 // renderToolCall formats the "● tool(args)" header.
 func renderToolCall(tc ToolCall) string {
 	return stAccent.Render("●") + " " + stToolName.Render(toolDisplayName(tc.Name)) +

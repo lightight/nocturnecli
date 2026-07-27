@@ -181,11 +181,25 @@ function bubble(cls, who, text){
 function line(cls, text){ const stick=atBottom(); const d=document.createElement('div'); d.className=cls; d.textContent=text; log.appendChild(d); if(stick) scroll(); }
 
 let busy = false;
-function setBusy(b){
-  busy = b;
-  sendBtn.textContent = b ? 'Stop' : 'Send';
-  sendBtn.classList.toggle('stop', b);
-}
+	let msgQueue = [];
+	function setBusy(b){
+	  busy = b;
+	  sendBtn.textContent = b ? 'Stop' : 'Send';
+	  sendBtn.classList.toggle('stop', b);
+	  if(b){
+	    inp.disabled = true;
+	    inp.placeholder = 'Nocturne is thinking…  (your messages will be queued)';
+	  } else {
+	    inp.disabled = false;
+	    inp.placeholder = 'Message your terminal session…  (/ for commands)';
+	    // flush any queued messages now that we're idle
+	    if(msgQueue.length){
+	      const pending = msgQueue.slice();
+	      msgQueue = [];
+	      pending.forEach(t => post(JSON.stringify({text: t})));
+	    }
+	  }
+	}
 
 function handleOne(ev){
   switch(ev.kind){
@@ -255,26 +269,27 @@ document.getElementById('pairform').addEventListener('submit', async (e) => {
 
 // --- slash command menu (mirrors the terminal's command list) --------------
 const COMMANDS = [
-  {name:'/help',       desc:'show commands'},
-  {name:'/model',      desc:'pick a model from a list (or /model <id>)'},
-  {name:'/level',      desc:'thinking: off · normal · extended'},
-  {name:'/permissions',desc:'how tool actions are approved (ask · auto · bypass)'},
-  {name:'/key',        desc:'save your API key (remembered everywhere)'},
-  {name:'/image',      desc:'attach an image file — /image <path>'},
-  {name:'/mouse',      desc:'capture the mouse for wheel scrolling (off = native text selection)'},
-  {name:'/cd',         desc:'change the working directory'},
-  {name:'/usage',      desc:'usage & quota — sent as a text summary'},
-  {name:'/cowork',     desc:'computer use — see & control this computer'},
-  {name:'/plan',       desc:'plan mode — read-only exploration, approve to execute'},
-  {name:'/compact',    desc:'summarize the conversation to free up context'},
-  {name:'/resume',     desc:'list saved chats — /resume <n> to open one'},
-  {name:'/new',        desc:'start a new chat'},
-  {name:'/remote',     desc:'show the pairing link & code (/remote off to stop)'},
-  {name:'/clear',      desc:'clear the conversation'},
-  {name:'/init',       desc:'generate a NOCTURNE.md for the project'},
-  {name:'/update',     desc:'update Nocturne to the latest release'},
-  {name:'/exit',       desc:'quit the terminal session'},
-];
+	  {name:'/help',       desc:'show commands'},
+	  {name:'/model',      desc:'pick a model from a list (or /model <id>)'},
+	  {name:'/level',      desc:'thinking: off · normal · extended'},
+	  {name:'/permissions',desc:'how tool actions are approved (ask · auto · bypass)'},
+	  {name:'/btw',        desc:'by the way — add a note without breaking flow'},
+	  {name:'/key',        desc:'save your API key (remembered everywhere)'},
+	  {name:'/image',      desc:'attach an image file — /image <path>'},
+	  {name:'/mouse',      desc:'capture the mouse for wheel scrolling (off = native text selection)'},
+	  {name:'/cd',         desc:'change the working directory'},
+	  {name:'/usage',      desc:'usage & quota — sent as a text summary'},
+	  {name:'/cowork',     desc:'computer use — see & control this computer'},
+	  {name:'/plan',       desc:'plan mode — read-only exploration, approve to execute'},
+	  {name:'/compact',    desc:'summarize the conversation to free up context'},
+	  {name:'/resume',     desc:'list saved chats — /resume <n> to open one'},
+	  {name:'/new',        desc:'start a new chat'},
+	  {name:'/remote',     desc:'show the pairing link & code (/remote off to stop)'},
+	  {name:'/clear',      desc:'clear the conversation'},
+	  {name:'/init',       desc:'generate a NOCTURNE.md for the project'},
+	  {name:'/update',     desc:'update Nocturne to the latest release'},
+	  {name:'/exit',       desc:'quit the terminal session'},
+	];
 let matches = [], msel = 0;
 function hideMenu(){ menu.style.display='none'; matches=[]; }
 function refreshMenu(){

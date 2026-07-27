@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestCanonicalTool(t *testing.T) {
@@ -153,6 +154,29 @@ func TestToStrings(t *testing.T) {
 	if toStrings(nil) != nil {
 		t.Error("nil should give nil")
 	}
+}
+
+func TestRunCommandBackground(t *testing.T) {
+	dir := t.TempDir()
+	out := execute(ToolCall{Name: "run", Args: map[string]any{
+		"command":    "printf hello",
+		"background": true,
+		"log":        "bg.log",
+	}}, dir)
+	if !contains(out, "Started background command") {
+		t.Fatalf("background run result = %q", out)
+	}
+
+	log := filepath.Join(dir, "bg.log")
+	var data []byte
+	for i := 0; i < 20; i++ {
+		data, _ = os.ReadFile(log)
+		if contains(string(data), "hello") {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("background log = %q, want hello", data)
 }
 
 // TestExecuteAliases drives the real execute() dispatcher through the aliased

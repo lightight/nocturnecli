@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 var imageExts = map[string]string{
@@ -40,7 +42,12 @@ func grabDarwin() (Image, error) {
 			return Image{MIME: "image/png", Data: out}, nil
 		}
 	}
-	// Fall back to AppleScript writing the clipboard PNG to a temp file.
+
+	// Fall back to AppKit via JXA. macOS often puts screenshots on the
+	// pasteboard as TIFF/NSImage data rather than raw PNG. Coercing with
+	// AppleScript's `the clipboard as «class PNGf»` can therefore fail with
+	// "Can't make some data into the expected type" (-2700). AppKit reads any
+	// pasteboard image representation and re-encodes it as PNG.
 	tmp, err := os.CreateTemp("", "nocturne-*.png")
 	if err != nil {
 		return Image{}, err
@@ -49,20 +56,40 @@ func grabDarwin() (Image, error) {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	script := fmt.Sprintf(`set p to POSIX file %q
-set f to (open for access p with write permission)
-try
-	set d to (the clipboard as «class PNGf»)
-	write d to f
-	close access f
-on error errMsg
-	close access f
-	error errMsg
-end try`, tmpPath)
+	script := fmt.Sprintf(`ObjC.import('AppKit');
+ObjC.import('Foundation');
 
-	cmd := exec.Command("osascript", "-e", script)
+const img = $.NSImage.alloc.initWithPasteboard($.NSPasteboard.generalPasteboard);
+if (!img) {
+	throw new Error('no image on clipboard');
+}
+
+const tiff = img.TIFFRepresentation;
+if (!tiff) {
+	throw new Error('no image on clipboard');
+}
+
+const rep = $.NSBitmapImageRep.imageRepWithData(tiff);
+if (!rep) {
+	throw new Error('could not decode clipboard image');
+}
+
+const png = rep.representationUsingTypeProperties(4, $());
+if (!png) {
+	throw new Error('could not encode clipboard image as PNG');
+}
+
+if (!png.writeToFileAtomically(%q, true)) {
+	throw new Error('could not write clipboard image');
+}`, tmpPath)
+
+	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", script)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return Image{}, fmt.Errorf("no image on clipboard (%s)", strings.TrimSpace(string(out)))
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return Image{}, fmt.Errorf("no image on clipboard (%s)", msg)
 	}
 	data, err := os.ReadFile(tmpPath)
 	if err != nil || len(data) == 0 {
@@ -183,25 +210,49 @@ func loadImageFile(path string) (Image, error) {
 
 // extractInlineImages scans submitted text for tokens that point at image
 // files on disk (optionally prefixed with @), attaches them, and returns the
-// text with those tokens removed.
+// text with those tokens removed while preserving all other whitespace. In
+// particular, keep user-entered newlines intact: those are part of the prompt
+// and should be echoed/sent exactly as typed.
 func extractInlineImages(text, workdir string) (string, []Image) {
-	fields := strings.Fields(text)
 	var images []Image
-	var kept []string
-	for _, f := range fields {
-		token := strings.TrimPrefix(f, "@")
-		token = strings.Trim(token, `"'`)
-		if _, ok := imageExts[strings.ToLower(filepath.Ext(token))]; ok {
-			p := token
-			if !filepath.IsAbs(p) {
-				p = filepath.Join(workdir, p)
-			}
-			if img, err := loadImageFile(p); err == nil {
-				images = append(images, img)
-				continue
-			}
+	var out strings.Builder
+
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r == utf8.RuneError && size == 0 {
+			break
 		}
-		kept = append(kept, f)
+		if !unicode.IsSpace(r) {
+			start := i
+			i += size
+			for i < len(text) {
+				r, size = utf8.DecodeRuneInString(text[i:])
+				if unicode.IsSpace(r) {
+					break
+				}
+				i += size
+			}
+
+			field := text[start:i]
+			token := strings.TrimPrefix(field, "@")
+			token = strings.Trim(token, `"'`)
+			if _, ok := imageExts[strings.ToLower(filepath.Ext(token))]; ok {
+				p := token
+				if !filepath.IsAbs(p) {
+					p = filepath.Join(workdir, p)
+				}
+				if img, err := loadImageFile(p); err == nil {
+					images = append(images, img)
+					continue
+				}
+			}
+			out.WriteString(field)
+			continue
+		}
+
+		out.WriteString(text[i : i+size])
+		i += size
 	}
-	return strings.Join(kept, " "), images
+
+	return strings.TrimSpace(out.String()), images
 }

@@ -28,6 +28,31 @@ type toolResult struct {
 	Image  *Image
 }
 
+// backgroundCommandResult is emitted when a command started with
+// {"background": true} exits. The TUI listens for these and surfaces them as
+// asynchronous notifications, so long-running commands are no longer fire-and-
+// forget from the user's perspective.
+type backgroundCommandResult struct {
+	PID      int
+	Command  string
+	LogPath  string
+	Started  time.Time
+	Finished time.Time
+	Err      error
+}
+
+var backgroundCommandResults = make(chan backgroundCommandResult, 64)
+
+func publishBackgroundCommandResult(r backgroundCommandResult) {
+	select {
+	case backgroundCommandResults <- r:
+	default:
+		// Avoid blocking a reaper goroutine if no UI is listening or the buffer is
+		// full. The command has already exited and been waited on; dropping the
+		// notification is better than leaking a goroutine.
+	}
+}
+
 const (
 	maxToolOutput = 20000 // chars fed back to the model per tool
 	cmdTimeout    = 120 * time.Second
@@ -632,24 +657,14 @@ func runCommandTool(workdir string, a map[string]any) string {
 	if command == "" {
 		return "Error: run requires a 'command'"
 	}
+	if argBool(a, "background") {
+		return runBackgroundCommandTool(workdir, a, command)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		// Force UTF-8 for both the console output encoding (how native command
-		// output is captured) and PowerShell's own pipeline encoding, so
-		// non-ASCII in the result isn't mangled into mojibake.
-		wrapped := "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " +
-			"$OutputEncoding=[System.Text.Encoding]::UTF8; " + command
-		cmd = exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", wrapped)
-	} else {
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		cmd = exec.CommandContext(ctx, shell, "-c", command)
-	}
+	cmd := shellCommand(ctx, command)
 	cmd.Dir = workdir
 
 	out, err := cmd.CombinedOutput()
@@ -663,6 +678,70 @@ func runCommandTool(workdir string, a map[string]any) string {
 		result = "(no output)"
 	}
 	return clip(result)
+}
+
+func shellCommand(ctx context.Context, command string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		// Force UTF-8 for both the console output encoding (how native command
+		// output is captured) and PowerShell's own pipeline encoding, so
+		// non-ASCII in the result isn't mangled into mojibake.
+		wrapped := "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " +
+			"$OutputEncoding=[System.Text.Encoding]::UTF8; " + command
+		if ctx != nil {
+			return exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", wrapped)
+		}
+		return exec.Command("powershell", "-NoProfile", "-Command", wrapped)
+	}
+
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	if ctx != nil {
+		return exec.CommandContext(ctx, shell, "-c", command)
+	}
+	return exec.Command(shell, "-c", command)
+}
+
+func runBackgroundCommandTool(workdir string, a map[string]any, command string) string {
+	logPath := firstNonEmpty(argStr(a, "log"), argStr(a, "log_path"))
+	if logPath == "" {
+		logPath = filepath.Join(".nocturne", "background", time.Now().Format("20060102-150405.000000000")+".log")
+	}
+	fullLog := resolve(workdir, logPath)
+	if err := os.MkdirAll(filepath.Dir(fullLog), 0o755); err != nil {
+		return "Error: " + err.Error()
+	}
+	logFile, err := os.OpenFile(fullLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+
+	cmd := shellCommand(nil, command)
+	cmd.Dir = workdir
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	started := time.Now()
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return "Error: " + err.Error()
+	}
+	pid := cmd.Process.Pid
+
+	go func() {
+		err := cmd.Wait()
+		_ = logFile.Close()
+		publishBackgroundCommandResult(backgroundCommandResult{
+			PID:      pid,
+			Command:  command,
+			LogPath:  logPath,
+			Started:  started,
+			Finished: time.Now(),
+			Err:      err,
+		})
+	}()
+
+	return fmt.Sprintf("Started background command (pid %d). Output is being appended to %s", pid, logPath)
 }
 
 func deleteFileTool(workdir string, a map[string]any) string {

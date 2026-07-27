@@ -163,10 +163,15 @@ func (s *relayServer) version(w http.ResponseWriter, r *http.Request) {
 
 func (s *relayServer) updateJSON(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"version": Version,
-		"url":     baseURL(r) + "/bin/" + assetName(),
-	})
+	resp := map[string]string{"version": Version}
+	// Point the client at the binary for *its* platform, taken from the os/arch
+	// query params the CLI sends — never the server's own platform. Without
+	// params (old clients, browsers) omit the URL so the client falls back to
+	// its own /bin/<asset> guess instead of downloading the wrong binary.
+	if goos, goarch := r.URL.Query().Get("os"), r.URL.Query().Get("arch"); validPlatform(goos, goarch) {
+		resp["url"] = baseURL(r) + "/bin/" + assetNameFor(goos, goarch)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *relayServer) installSh(w http.ResponseWriter, r *http.Request) {

@@ -41,11 +41,28 @@ func repoSlug() string {
 // produced by the release workflow / Makefile dist target and served from
 // nocturnecode.lol/bin/.
 func assetName() string {
-	name := fmt.Sprintf("nocturne_%s_%s", runtime.GOOS, runtime.GOARCH)
-	if runtime.GOOS == "windows" {
+	return assetNameFor(runtime.GOOS, runtime.GOARCH)
+}
+
+// assetNameFor is the release asset name for an arbitrary platform. It must
+// only be called with values from validPlatform.
+func assetNameFor(goos, goarch string) string {
+	name := fmt.Sprintf("nocturne_%s_%s", goos, goarch)
+	if goos == "windows" {
 		name += ".exe"
 	}
 	return name
+}
+
+// validPlatform reports whether goos/goarch name a platform the project ships
+// binaries for.
+func validPlatform(goos, goarch string) bool {
+	switch goos {
+	case "darwin", "linux", "windows":
+	default:
+		return false
+	}
+	return goarch == "amd64" || goarch == "arm64"
 }
 
 func normVersion(v string) string { return strings.TrimPrefix(strings.TrimSpace(v), "v") }
@@ -147,7 +164,7 @@ func checkHostedUpdate() (updateInfo, error) {
 }
 
 func fetchUpdateJSON(ctx context.Context, base string) (updateInfo, error) {
-	url := base + "/update.json"
+	url := base + "/update.json?os=" + runtime.GOOS + "&arch=" + runtime.GOARCH
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "nocturne-cli")

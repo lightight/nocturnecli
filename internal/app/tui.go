@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -167,8 +168,8 @@ type tuiModel struct {
 	party     bool
 	partyTick int
 
-	// repeated-tool-call stack counts, keyed by tool signature
-	toolSeen map[string]int
+	// completed background commands waiting to be handed back to the AI
+	backgroundDone []backgroundCommandResult
 
 	// /remote connection progress (async handshake with the relay)
 	remoteConnecting bool
@@ -275,8 +276,16 @@ type remoteReadyMsg struct {
 	err error
 }
 
+type backgroundCommandDoneMsg struct{ result backgroundCommandResult }
+
 func remoteTickCmd() tea.Cmd {
 	return tea.Tick(90*time.Millisecond, func(time.Time) tea.Msg { return remoteTickMsg{} })
+}
+
+func waitBackgroundCommandDoneCmd() tea.Cmd {
+	return func() tea.Msg {
+		return backgroundCommandDoneMsg{result: <-backgroundCommandResults}
+	}
 }
 
 // --- lifecycle -------------------------------------------------------------
@@ -357,7 +366,7 @@ func startTUI(cfg *Config, version string, cowork bool) error {
 }
 
 func (m *tuiModel) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.fetchModelsCmd(""), m.validateKeyCmd(), m.startupUpdateCmd())
+	return tea.Batch(textarea.Blink, m.fetchModelsCmd(""), m.validateKeyCmd(), m.startupUpdateCmd(), waitBackgroundCommandDoneCmd())
 }
 
 // validateKeyCmd verifies the API key with the server in the background so a
@@ -464,6 +473,9 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toolDoneMsg:
 		return m.handleToolDone(msg)
+
+	case backgroundCommandDoneMsg:
+		return m.handleBackgroundCommandDone(msg.result)
 
 	case imageGrabbedMsg:
 		if msg.err != nil {
@@ -573,12 +585,14 @@ func (m *tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyUp, tea.KeyDown:
 		// With mouse capture off (the default) most terminals report the
 		// wheel as Up/Down keys in the alt screen. Route arrows to the
-		// transcript wherever they can't do anything else: while the bot is
-		// busy, or in the input when it has a single line (arrows can't move
-		// the cursor there) and no "/" menu is open.
+		// transcript wherever they can't do anything else: in the input when
+		// it has a single line (arrows can't move the cursor there) and no
+		// "/" menu is open. While the bot is busy, still let arrows edit a
+		// multi-line draft; otherwise they keep scrolling the transcript.
 		busy := m.mode == modeThinking || m.mode == modeStreaming
 		idleInput := m.mode == modeInput && !m.showSlash && !strings.Contains(m.ta.Value(), "\n")
-		if busy || idleInput {
+		busySingleLineDraft := busy && !strings.Contains(m.ta.Value(), "\n")
+		if idleInput || busySingleLineDraft {
 			var cmd tea.Cmd
 			m.vp, cmd = m.vp.Update(msg)
 			m.follow = m.vp.AtBottom()
@@ -599,8 +613,9 @@ func (m *tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.cancel != nil {
 				m.cancel()
 			}
+			return m, nil
 		}
-		return m, nil
+		return m.handleBusyInputKey(msg)
 	case modeConfirm:
 		return m.handleConfirmKey(msg)
 	case modeAsk:
@@ -831,6 +846,39 @@ func (m *tuiModel) handleDashKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *tuiModel) handleBusyInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Let the user prepare the next message while the model is thinking or
+	// streaming. Do not submit slash commands or start another request until the
+	// current turn has fully finished.
+	if msg.Paste {
+		if img, ok := tryPasteImage(string(msg.Runes), m.work); ok {
+			m.attachments = append(m.attachments, img)
+			m.follow = true
+			m.syncViewport()
+			return m, nil
+		}
+	}
+
+	switch msg.Type {
+	case tea.KeyCtrlD:
+		m.quitting = true
+		return m, tea.Quit
+	case tea.KeyCtrlV:
+		return m, grabImageCmd()
+	case tea.KeyEnter:
+		if msg.Alt {
+			m.ta.InsertString("\n")
+			m.refreshSlash()
+		}
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.ta, cmd = m.ta.Update(msg)
+	m.refreshSlash()
+	return m, cmd
 }
 
 func (m *tuiModel) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1129,19 +1177,9 @@ func (m *tuiModel) runTaskCmd(tc ToolCall) tea.Cmd {
 	}
 }
 
-// pushToolCall prints a tool-call header, collapsing repeats of the exact same
-// call into a running "↻×N" stack count instead of stacking duplicate lines.
+// pushToolCall prints a tool-call header.
 func (m *tuiModel) pushToolCall(tc ToolCall) {
-	if m.toolSeen == nil {
-		m.toolSeen = map[string]int{}
-	}
-	sig := canonicalTool(tc.Name) + "|" + tc.summarize()
-	m.toolSeen[sig]++
-	line := renderToolCall(tc)
-	if n := m.toolSeen[sig]; n > 1 {
-		line += "  " + stackBadge(n)
-	}
-	m.push(line)
+	m.push(renderToolCall(tc))
 }
 
 func (m *tuiModel) startSpinner() tea.Cmd {
@@ -1221,6 +1259,9 @@ func (m *tuiModel) finishReply(text string, usage Usage, quota Quota) (tea.Model
 		}
 		m.toRemote("assistant", narration)
 		m.persistSession()
+		if len(m.backgroundDone) > 0 {
+			return m, m.startBackgroundCommandReply()
+		}
 		if m.ctxTokens >= autoCompactThreshold && !m.compacting {
 			return m, m.compactCmd(true)
 		}
@@ -1494,6 +1535,63 @@ func (m *tuiModel) handleToolDone(msg toolDoneMsg) (tea.Model, tea.Cmd) {
 	m.push(renderToolResult(msg.output))
 	m.toRemote("tool", "  └ "+oneLine(firstLine(msg.output), 100))
 	return m, m.advanceTools()
+}
+
+func (m *tuiModel) handleBackgroundCommandDone(r backgroundCommandResult) (tea.Model, tea.Cmd) {
+	m.push(renderToolResult(formatBackgroundCommandNotification(r)))
+	m.toRemote("tool", "  └ background finished: "+oneLine(r.Command, 80))
+	cmd := waitBackgroundCommandDoneCmd()
+	if m.busy() || m.mode != modeInput {
+		m.backgroundDone = append(m.backgroundDone, r)
+		return m, cmd
+	}
+	m.backgroundDone = append(m.backgroundDone, r)
+	return m, tea.Batch(cmd, m.startBackgroundCommandReply())
+}
+
+func (m *tuiModel) startBackgroundCommandReply() tea.Cmd {
+	if len(m.backgroundDone) == 0 || m.busy() || m.mode != modeInput {
+		return nil
+	}
+	r := m.backgroundDone[0]
+	m.backgroundDone = m.backgroundDone[1:]
+	m.messages = append(m.messages, ChatMessage{Role: "user", Content: buildBackgroundCommandResult(r)})
+	return m.startReply()
+}
+
+func formatBackgroundCommandNotification(r backgroundCommandResult) string {
+	status := "finished"
+	if r.Err != nil {
+		status = "failed: " + oneLine(r.Err.Error(), 200)
+	}
+	return fmt.Sprintf("Background command %s (pid %d, ran %s). Log: %s\n%s", status, r.PID, r.Finished.Sub(r.Started).Round(time.Millisecond), r.LogPath, tailFileForPrompt(r.LogPath))
+}
+
+func buildBackgroundCommandResult(r backgroundCommandResult) string {
+	status := "finished successfully"
+	if r.Err != nil {
+		status = "exited with error: " + r.Err.Error()
+	}
+	return fmt.Sprintf("Background command completed. Continue responding to the user based on this result.\n\nCommand: %s\nPID: %d\nStatus: %s\nRuntime: %s\nLog path: %s\n\nRecent log output:\n%s", r.Command, r.PID, status, r.Finished.Sub(r.Started).Round(time.Millisecond), r.LogPath, tailFileForPrompt(r.LogPath))
+}
+
+func tailFileForPrompt(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "(could not read log: " + err.Error() + ")"
+	}
+	const max = 12000
+	if len(b) > max {
+		b = b[len(b)-max:]
+		if i := bytes.IndexByte(b, '\n'); i >= 0 && i+1 < len(b) {
+			b = b[i+1:]
+		}
+		return "…\n" + string(b)
+	}
+	if len(b) == 0 {
+		return "(log is empty)"
+	}
+	return string(b)
 }
 
 // --- compaction ------------------------------------------------------------

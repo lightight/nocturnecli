@@ -327,7 +327,7 @@ Rules:
 - rename — rename or move a file. Args: {"from": string, "to": string}.
 - list_dir — list a directory. Args: {"path"?: string} (defaults to ".").
 - search — regex search across files. Args: {"pattern": string, "path"?: string}.
-- run — run the project, or any shell command, and read its output/logs back. Args: {"command": string}.
+- run — run the project, or any shell command, and read its output/logs back. Args: {"command": string, "background"?: bool, "log"?: string}. Set background=true for long-running servers/watchers; it returns immediately and appends output to the log path.
 - import_github — clone a public GitHub repo's files into the workspace (aliases: github, import,
   clone). Args: {"repo": string (owner/name or a full URL), "dir"?: string}.
 - ask — pause and ask the user a question with selectable options; their choice comes back as the
