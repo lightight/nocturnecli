@@ -127,6 +127,8 @@ func (s *relayServer) get(id string) *relaySession {
 func (s *relayServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.index)
+	mux.HandleFunc("GET /version", s.version)
+	mux.HandleFunc("GET /update.json", s.updateJSON)
 	mux.HandleFunc("GET /install.sh", s.installSh)
 	mux.HandleFunc("GET /install.ps1", s.installPs1)
 	mux.HandleFunc("GET /r/{id}", s.remoteUI)
@@ -152,6 +154,19 @@ func baseURL(r *http.Request) string {
 func (s *relayServer) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, s.assets.Docs)
+}
+
+func (s *relayServer) version(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	io.WriteString(w, Version+"\n")
+}
+
+func (s *relayServer) updateJSON(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"version": Version,
+		"url":     baseURL(r) + "/bin/" + assetName(),
+	})
 }
 
 func (s *relayServer) installSh(w http.ResponseWriter, r *http.Request) {

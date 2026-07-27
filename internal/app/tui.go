@@ -209,6 +209,11 @@ type updateDoneMsg struct {
 	err  error
 }
 
+type startupUpdateMsg struct {
+	info updateInfo
+	err  error
+}
+
 type modelsLoadedMsg struct {
 	models []ModelInfo
 	def    string
@@ -352,7 +357,7 @@ func startTUI(cfg *Config, version string, cowork bool) error {
 }
 
 func (m *tuiModel) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.fetchModelsCmd(""), m.validateKeyCmd())
+	return tea.Batch(textarea.Blink, m.fetchModelsCmd(""), m.validateKeyCmd(), m.startupUpdateCmd())
 }
 
 // validateKeyCmd verifies the API key with the server in the background so a
@@ -367,6 +372,13 @@ func (m *tuiModel) validateKeyCmd() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return keyCheckedMsg{err: client.ValidateKey(ctx)}
+	}
+}
+
+func (m *tuiModel) startupUpdateCmd() tea.Cmd {
+	return func() tea.Msg {
+		info, err := checkHostedUpdate()
+		return startupUpdateMsg{info: info, err: err}
 	}
 }
 
@@ -468,6 +480,16 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.push(stErr.Render("  ✗ update: " + msg.err.Error()))
 		} else {
 			m.push(stOK.Render("  ⟳ " + msg.text))
+		}
+		return m, nil
+
+	case startupUpdateMsg:
+		if msg.err != nil {
+			return m, nil
+		}
+		latest := msg.info.Version
+		if compareVersions(m.ver, latest) < 0 {
+			m.push(stHint.Render(fmt.Sprintf("  update available: %s → %s — run /update to install", m.ver, latest)))
 		}
 		return m, nil
 
