@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wrap"
 )
 
 // Nocturne palette — warm amber primary (echoing the inspiration) with a
@@ -124,7 +125,7 @@ func rainbowText(s string, offset int) string {
 }
 
 // renderUser formats an echoed user message for the scrollback.
-func renderUser(text string, nImages int) string {
+func renderUser(text string, nImages, width int) string {
 	head := stUser.Render("›") + " "
 	body := text
 	if nImages > 0 {
@@ -133,6 +134,19 @@ func renderUser(text string, nImages int) string {
 			body = stDim.Render("(image)")
 		}
 		body += tag
+	}
+
+	// The textarea wraps long prompts while editing; do the same after the
+	// message is submitted so long user requests don't run off the terminal.
+	// Account for the leading prompt marker and indent continuation lines to
+	// keep multi-line messages visually grouped under the request.
+	contentWidth := width - lipgloss.Width(head)
+	if contentWidth < 8 {
+		contentWidth = 8
+	}
+	body = wrap.String(body, contentWidth)
+	if strings.Contains(body, "\n") {
+		body = strings.ReplaceAll(body, "\n", "\n  ")
 	}
 	return head + body
 }

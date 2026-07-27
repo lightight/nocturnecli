@@ -98,6 +98,7 @@ type tuiModel struct {
 	lines       []string // transcript blocks (the scrollback)
 	messages    []ChatMessage
 	attachments []Image
+	queuedInput []string // prompts/slash commands submitted while the agent is busy
 
 	pending     []ToolCall
 	results     []toolResult
@@ -849,9 +850,9 @@ func (m *tuiModel) handleDashKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *tuiModel) handleBusyInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Let the user prepare the next message while the model is thinking or
-	// streaming. Do not submit slash commands or start another request until the
-	// current turn has fully finished.
+	// Let the user prepare the next message while the model is thinking,
+	// streaming, or running tools. Enter queues the draft so it runs as soon as
+	// the current agent turn settles; it must not start a second request now.
 	if msg.Paste {
 		if img, ok := tryPasteImage(string(msg.Runes), m.work); ok {
 			m.attachments = append(m.attachments, img)
@@ -871,8 +872,9 @@ func (m *tuiModel) handleBusyInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.Alt {
 			m.ta.InsertString("\n")
 			m.refreshSlash()
+			return m, nil
 		}
-		return m, nil
+		return m.queueBusyDraft()
 	}
 
 	var cmd tea.Cmd
@@ -1041,7 +1043,7 @@ func (m *tuiModel) submit() (tea.Model, tea.Cmd) {
 
 	m.messages = append(m.messages, ChatMessage{Role: "user", Content: text, Images: imgs})
 	m.noteTitle(text)
-	m.push(renderUser(text, len(imgs)))
+	m.push(renderUser(text, len(imgs), m.width))
 	m.toRemote("user", text)
 
 	// When the active model can't see images, have a vision model describe them
@@ -1060,8 +1062,58 @@ func (m *tuiModel) submitText(text string) (tea.Model, tea.Cmd) {
 	m.follow = true
 	m.messages = append(m.messages, ChatMessage{Role: "user", Content: text})
 	m.noteTitle(text)
-	m.push(renderUser(text, 0))
+	m.push(renderUser(text, 0, m.width))
 	return m, m.startReply()
+}
+
+func (m *tuiModel) queueBusyDraft() (tea.Model, tea.Cmd) {
+	raw := strings.TrimSpace(m.ta.Value())
+	if raw == "" {
+		return m, nil
+	}
+	m.ta.Reset()
+	m.showSlash = false
+	m.refreshSlash()
+	m.queueText(raw)
+	return m, nil
+}
+
+func (m *tuiModel) queueText(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	m.queuedInput = append(m.queuedInput, text)
+	note := "queued: " + oneLine(text, 80)
+	m.push(stHint.Render("  " + note))
+	m.toRemote("status", note)
+}
+
+func (m *tuiModel) runQueuedInput() (bool, tea.Cmd) {
+	if len(m.queuedInput) == 0 || m.busy() || m.mode != modeInput {
+		return false, nil
+	}
+	text := m.queuedInput[0]
+	m.queuedInput = m.queuedInput[1:]
+	if strings.HasPrefix(text, "/") {
+		_, cmd := m.runSlash(text, false)
+		return true, cmd
+	}
+	_, cmd := m.submitText(text)
+	return true, cmd
+}
+
+func (m *tuiModel) settleIdleCmd() tea.Cmd {
+	if ran, cmd := m.runQueuedInput(); ran {
+		return cmd
+	}
+	if len(m.backgroundDone) > 0 {
+		return m.startBackgroundCommandReply()
+	}
+	if m.ctxTokens >= autoCompactThreshold && !m.compacting {
+		return m.compactCmd(true)
+	}
+	return nil
 }
 
 // noteTitle records the first real user message as the session's stable title.
@@ -1076,7 +1128,9 @@ func (m *tuiModel) noteTitle(text string) {
 	m.sessTitle = t
 }
 
-func (m *tuiModel) busy() bool { return m.mode == modeThinking || m.mode == modeStreaming }
+func (m *tuiModel) busy() bool {
+	return m.mode == modeThinking || m.mode == modeStreaming || m.mode == modeConfirm || m.mode == modeAsk
+}
 
 func (m *tuiModel) startReply() tea.Cmd {
 	m.started = time.Now()
@@ -1195,7 +1249,7 @@ func (m *tuiModel) startSpinner() tea.Cmd {
 func (m *tuiModel) handleAPIResp(msg apiRespMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		m.replyError(msg.err)
-		return m, nil
+		return m, m.settleIdleCmd()
 	}
 	return m.finishReply(msg.text, msg.usage, msg.quota)
 }
@@ -1204,7 +1258,7 @@ func (m *tuiModel) handleStreamDelta(msg streamDeltaMsg) (tea.Model, tea.Cmd) {
 	ev := msg.ev
 	if ev.Err != nil {
 		m.replyError(ev.Err)
-		return m, nil
+		return m, m.settleIdleCmd()
 	}
 	if ev.Done {
 		return m.finishReply(m.streamBuf, ev.Usage, ev.Quota)
@@ -1259,13 +1313,7 @@ func (m *tuiModel) finishReply(text string, usage Usage, quota Quota) (tea.Model
 		}
 		m.toRemote("assistant", narration)
 		m.persistSession()
-		if len(m.backgroundDone) > 0 {
-			return m, m.startBackgroundCommandReply()
-		}
-		if m.ctxTokens >= autoCompactThreshold && !m.compacting {
-			return m, m.compactCmd(true)
-		}
-		return m, nil
+		return m, m.settleIdleCmd()
 	}
 
 	if narration != "" {
@@ -1281,7 +1329,7 @@ func (m *tuiModel) advanceTools() tea.Cmd {
 	if len(m.pending) == 0 {
 		if len(m.results) == 0 {
 			m.mode = modeInput
-			return nil
+			return m.settleIdleCmd()
 		}
 		// Screenshots ride along on the results message so the model can see
 		// what its screen actions produced.
@@ -1486,7 +1534,7 @@ func (m *tuiModel) finishTask(tc ToolCall) tea.Cmd {
 	}
 	m.toRemote("assistant", summary)
 	m.persistSession()
-	return nil
+	return m.settleIdleCmd()
 }
 
 // beginAsk pauses the loop and presents the model's question with selectable
@@ -1622,7 +1670,7 @@ func (m *tuiModel) handleCompactDone(msg compactDoneMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.push(stErr.Render("  ✗ compact: " + msg.err.Error()))
 		}
-		return m, nil
+		return m, m.settleIdleCmd()
 	}
 	before := m.ctxTokens
 	m.messages = []ChatMessage{{
@@ -1724,7 +1772,7 @@ func (m *tuiModel) restoreSession(s Session) {
 			if c == "" || strings.HasPrefix(c, "<tool_result") {
 				continue
 			}
-			m.push(renderUser(c, len(msg.Images)))
+			m.push(renderUser(c, len(msg.Images), m.width))
 		case "assistant":
 			if narr, _ := parseResponse(msg.Content); narr != "" {
 				m.push(m.renderAssistant(narr))
@@ -1790,7 +1838,7 @@ func (m *tuiModel) handleRemoteSubmit(msg remoteSubmitMsg) (tea.Model, tea.Cmd) 
 		return m, nil
 	}
 	if m.busy() {
-		m.toRemote("status", "busy — wait for the current reply to finish")
+		m.queueText(text)
 		return m, nil
 	}
 	if strings.HasPrefix(text, "/") {
@@ -1805,7 +1853,7 @@ func (m *tuiModel) handleRemoteSubmit(msg remoteSubmitMsg) (tea.Model, tea.Cmd) 
 	m.follow = true
 	m.messages = append(m.messages, ChatMessage{Role: "user", Content: text})
 	m.noteTitle(text)
-	m.push(renderUser(text, 0) + " " + stDim.Render("(remote)"))
+	m.push(renderUser(text, 0, m.width) + " " + stDim.Render("(remote)"))
 	m.toRemote("user", text)
 	return m, m.startReply()
 }
