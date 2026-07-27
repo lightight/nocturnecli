@@ -2,7 +2,16 @@ package app
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -50,14 +59,15 @@ var envKeys = []string{"NOCTURNE_API", "NOCTURNE_API_KEY", "NOCTURE_API"}
 // .env file. The .env ranks last so a stale project .env can't silently
 // override a key the user deliberately saved.
 type Config struct {
-	APIKey      string   `json:"api_key,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	BaseURL     string   `json:"base_url,omitempty"`
-	Stream      bool     `json:"stream"`                // live-stream replies (default true)
-	Level       string   `json:"level,omitempty"`       // thinking: off · normal · extended
-	Perm        string   `json:"perm,omitempty"`        // approval mode: ask · smart · bypass
-	Temperature *float64 `json:"temperature,omitempty"` // 0–2 (unset = API default)
-	Trusted     []string `json:"trusted,omitempty"`     // absolute paths the user has trusted
+	APIKey      string       `json:"api_key,omitempty"`
+	Model       string       `json:"model,omitempty"`
+	BaseURL     string       `json:"base_url,omitempty"`
+	Stream      bool         `json:"stream"`                // live-stream replies (default true)
+	Level       string       `json:"level,omitempty"`       // thinking: off · normal · extended
+	Perm        string       `json:"perm,omitempty"`        // approval mode: ask · smart · bypass
+	Temperature *float64     `json:"temperature,omitempty"` // 0–2 (unset = API default)
+	Trusted     []string     `json:"trusted,omitempty"`     // absolute paths the user has trusted
+	Tools       []CustomTool `json:"tools,omitempty"`       // user-installed shell-backed tools
 
 	path           string // resolved config-file path (not serialized)
 	keyFromEnv     bool   // true when APIKey came from the environment or a .env
@@ -66,14 +76,20 @@ type Config struct {
 }
 
 type persisted struct {
-	APIKey      string   `json:"api_key,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	BaseURL     string   `json:"base_url,omitempty"`
-	Stream      *bool    `json:"stream,omitempty"` // pointer so "absent" stays default-on
-	Level       string   `json:"level,omitempty"`
-	Perm        string   `json:"perm,omitempty"`
-	Temperature *float64 `json:"temperature,omitempty"`
-	Trusted     []string `json:"trusted,omitempty"`
+	// APIKey is the legacy plaintext field. New saves write APIKeyEnc instead;
+	// loads still accept APIKey so existing users migrate automatically after the
+	// next Save().
+	APIKey      string       `json:"api_key,omitempty"`
+	APIKeyEnc   string       `json:"api_key_enc,omitempty"`
+	APIKeyHash  string       `json:"api_key_hash,omitempty"`
+	Model       string       `json:"model,omitempty"`
+	BaseURL     string       `json:"base_url,omitempty"`
+	Stream      *bool        `json:"stream,omitempty"` // pointer so "absent" stays default-on
+	Level       string       `json:"level,omitempty"`
+	Perm        string       `json:"perm,omitempty"`
+	Temperature *float64     `json:"temperature,omitempty"`
+	Trusted     []string     `json:"trusted,omitempty"`
+	Tools       []CustomTool `json:"tools,omitempty"`
 }
 
 // configDir returns the directory that holds Nocturne's config file,
@@ -124,8 +140,18 @@ func loadConfig(path string) *Config {
 			cfg.Level = p.Level
 			cfg.Temperature = p.Temperature
 			cfg.Trusted = p.Trusted
-			cfg.APIKey = p.APIKey
-			cfg.keyPersisted = p.APIKey != ""
+			cfg.Tools = normalizeCustomTools(p.Tools)
+			if p.APIKeyEnc != "" {
+				if k, err := decryptAPIKey(p.APIKeyEnc); err == nil && k != "" {
+					cfg.APIKey = k
+					cfg.keyPersisted = true
+				}
+			} else if p.APIKey != "" {
+				// Legacy plaintext config: load it for compatibility. The next Save()
+				// writes it back encrypted and omits this field.
+				cfg.APIKey = p.APIKey
+				cfg.keyPersisted = true
+			}
 		}
 	}
 
@@ -247,16 +273,95 @@ func (c *Config) Save() error {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
 		return err
 	}
-	p := persisted{Model: normalizeModelID(c.Model), BaseURL: c.BaseURL, Stream: &c.Stream, Level: c.Level, Perm: normalizePerm(c.Perm), Temperature: c.Temperature, Trusted: c.Trusted}
-	if !c.keyFromEnv {
-		p.APIKey = c.APIKey
-		c.keyPersisted = c.APIKey != ""
+	p := persisted{Model: normalizeModelID(c.Model), BaseURL: c.BaseURL, Stream: &c.Stream, Level: c.Level, Perm: normalizePerm(c.Perm), Temperature: c.Temperature, Trusted: c.Trusted, Tools: normalizeCustomTools(c.Tools)}
+	if !c.keyFromEnv && c.APIKey != "" {
+		enc, err := encryptAPIKey(c.APIKey)
+		if err != nil {
+			return err
+		}
+		p.APIKeyEnc = enc
+		p.APIKeyHash = hashAPIKey(c.APIKey)
+		c.keyPersisted = true
 	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(c.path, data, 0o600)
+}
+
+const encryptedAPIKeyPrefix = "nocturne:v1:"
+
+func hashAPIKey(k string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(k)))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func apiKeyEncryptionKey() [32]byte {
+	home, _ := os.UserHomeDir()
+	userCfg, _ := os.UserConfigDir()
+	seed := strings.Join([]string{
+		"nocturne-cli-api-key-v1",
+		runtime.GOOS,
+		runtime.GOARCH,
+		home,
+		userCfg,
+	}, "\x00")
+	return sha256.Sum256([]byte(seed))
+}
+
+func encryptAPIKey(k string) (string, error) {
+	k = strings.TrimSpace(k)
+	if k == "" {
+		return "", nil
+	}
+	key := apiKeyEncryptionKey()
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", fmt.Errorf("encrypt API key: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("encrypt API key: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("encrypt API key: %w", err)
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(k), nil)
+	blob := append(nonce, sealed...)
+	return encryptedAPIKeyPrefix + base64.RawURLEncoding.EncodeToString(blob), nil
+}
+
+func decryptAPIKey(s string) (string, error) {
+	if s == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(s, encryptedAPIKeyPrefix) {
+		return "", errors.New("unsupported encrypted API key format")
+	}
+	blob, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, encryptedAPIKeyPrefix))
+	if err != nil {
+		return "", fmt.Errorf("decrypt API key: %w", err)
+	}
+	key := apiKeyEncryptionKey()
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", fmt.Errorf("decrypt API key: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("decrypt API key: %w", err)
+	}
+	if len(blob) < gcm.NonceSize() {
+		return "", errors.New("decrypt API key: ciphertext too short")
+	}
+	nonce, ciphertext := blob[:gcm.NonceSize()], blob[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", fmt.Errorf("decrypt API key: %w", err)
+	}
+	return string(plain), nil
 }
 
 // loadDotEnv parses a KEY=VALUE file and sets any vars not already present

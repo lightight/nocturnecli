@@ -1,6 +1,7 @@
 package app
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,42 +10,53 @@ import (
 	"strings"
 )
 
-// toolBlock matches a <tool name="...">{json}</tool> emitted by the model.
-// It is intentionally lenient about quoting and whitespace.
-var toolBlock = regexp.MustCompile(`(?s)<tool\s+name=["']?([a-zA-Z_]+)["']?\s*>(.*?)</tool>`)
+// toolOpenTag/toolCloseTag are built without embedding the literal sentinel in
+// source strings that the outer tool parser also scans.
+var toolOpenTag = string(rune(60)) + "tool"
+var toolCloseTag = string(rune(60)) + "/tool"
 
-// resultBlock matches a <tool_result>…</tool_result> — these are produced by
-// the CLI, but the model sometimes hallucinates them inside its own reply, so
-// we strip them from anything shown to the user.
-var resultBlock = regexp.MustCompile(`(?s)<tool_result[^>]*>.*?</tool_result>`)
+// toolBlock remains for stream-cleaning; parseResponse uses scanToolBlocks so a
+// closing tag inside a JSON string cannot terminate the call early.
+var toolBlock = regexp.MustCompile(`(?is)` + toolOpenTag + `\s+name\s*=\s*["']?([a-zA-Z][a-zA-Z0-9_-]*)["']?\s*>(.*?)` + toolCloseTag + `\s*>`)
 
-// toolBlockAlt matches the function-call-style tag some models emit, e.g.
-// <tool>read_file({"path":"x"})</tool>, so it can be normalised to the canonical form.
-var toolBlockAlt = regexp.MustCompile(`(?s)<tool>\s*([a-zA-Z_]+)\s*\(\s*(\{.*?\})\s*\)\s*</tool>`)
+// resultBlock matches tool-result blocks produced by the CLI. The model
+// sometimes hallucinates them inside its own reply, so strip them from display.
+var resultBlock = regexp.MustCompile(`(?s)` + toolOpenTag + `_result[^>]*>.*?` + string(rune(60)) + `/tool_result>`)
 
-// parseResponse splits a model reply into the prose shown to the user and any
-// tool calls it requested. When there are no tool calls the whole reply is the
-// final answer.
+// toolBlockAlt matches function-call-style tags some models emit, so they can
+// be normalised to the canonical named form before scanning.
+var toolBlockAlt = regexp.MustCompile(`(?s)` + toolOpenTag + `>\s*([a-zA-Z][a-zA-Z0-9_-]*)\s*\(\s*(\{.*?\})\s*\)\s*` + toolCloseTag + `\s*>`)
+
+var toolStartName = regexp.MustCompile(`(?is)\bname\s*=\s*["']?([a-zA-Z][a-zA-Z0-9_-]*)["']?`)
+
+type parsedToolBlock struct {
+	start int
+	end   int
+	name  string
+	raw   string
+}
+
+// parseResponse splits a model reply into prose shown to the user and tool
+// calls requested by the model.
 func parseResponse(text string) (narration string, calls []ToolCall) {
-	text = toolBlockAlt.ReplaceAllString(text, `<tool name="$1">$2</tool>`)
-	matches := toolBlock.FindAllStringSubmatchIndex(text, -1)
+	text = toolBlockAlt.ReplaceAllString(text, toolOpenTag+` name="$1">$2`+toolCloseTag+`>`)
+	matches := scanToolBlocks(text)
 	if len(matches) == 0 {
-		return strings.TrimSpace(text), nil
+		narration = resultBlock.ReplaceAllString(text, "")
+		return strings.TrimSpace(narration), nil
 	}
 
 	var prose strings.Builder
 	last := 0
-	for _, m := range matches {
-		prose.WriteString(text[last:m[0]])
-		last = m[1]
+	for _, mb := range matches {
+		prose.WriteString(text[last:mb.start])
+		last = mb.end
 
-		name := text[m[2]:m[3]]
-		raw := strings.TrimSpace(text[m[4]:m[5]])
+		raw := strings.TrimSpace(mb.raw)
 		raw = stripFences(raw)
 
-		tc := ToolCall{Name: name, Args: map[string]any{}}
+		tc := ToolCall{Name: mb.name, Args: map[string]any{}}
 		if raw != "" && !parseArgs(raw, &tc.Args) {
-			// Carry the parse failure so the model gets actionable feedback.
 			tc.Args = map[string]any{"__parse_error": true, "__raw": oneLine(raw, 300)}
 		}
 		calls = append(calls, tc)
@@ -54,6 +66,76 @@ func parseResponse(text string) (narration string, calls []ToolCall) {
 	narration = resultBlock.ReplaceAllString(prose.String(), "")
 	narration = strings.TrimSpace(narration)
 	return narration, dedupeCalls(calls)
+}
+
+func scanToolBlocks(text string) []parsedToolBlock {
+	var out []parsedToolBlock
+	lower := strings.ToLower(text)
+	openResult := toolOpenTag + "_result"
+	for pos := 0; pos < len(text); {
+		i := strings.Index(lower[pos:], toolOpenTag)
+		if i < 0 {
+			break
+		}
+		i += pos
+		if strings.HasPrefix(lower[i:], openResult) {
+			pos = i + len(toolOpenTag)
+			continue
+		}
+		gtRel := strings.IndexByte(text[i:], '>')
+		if gtRel < 0 {
+			break
+		}
+		gt := i + gtRel
+		name, ok := parseToolStartName(text[i : gt+1])
+		if !ok {
+			pos = gt + 1
+			continue
+		}
+		bodyStart := gt + 1
+		bodyEnd, tagEnd := findToolBodyEnd(text, bodyStart)
+		if tagEnd < 0 {
+			pos = bodyStart
+			continue
+		}
+		out = append(out, parsedToolBlock{start: i, end: tagEnd, name: name, raw: text[bodyStart:bodyEnd]})
+		pos = tagEnd
+	}
+	return out
+}
+
+func parseToolStartName(tag string) (string, bool) {
+	m := toolStartName.FindStringSubmatch(tag)
+	if len(m) != 2 {
+		return "", false
+	}
+	return m[1], true
+}
+
+func findToolBodyEnd(text string, start int) (int, int) {
+	if _, objEnd, ok := extractJSONObjectSpan(text[start:]); ok {
+		if closeStart, closeEnd := findCloseToolTag(text, start+objEnd); closeEnd >= 0 {
+			return closeStart, closeEnd
+		}
+	}
+	return findCloseToolTag(text, start)
+}
+
+func findCloseToolTag(text string, pos int) (int, int) {
+	lower := strings.ToLower(text)
+	for pos < len(text) {
+		i := strings.Index(lower[pos:], toolCloseTag)
+		if i < 0 {
+			return -1, -1
+		}
+		i += pos
+		gtRel := strings.IndexByte(text[i:], '>')
+		if gtRel < 0 {
+			return -1, -1
+		}
+		return i, i + gtRel + 1
+	}
+	return -1, -1
 }
 
 // parseArgs decodes a tool-call argument object, tolerating the malformed JSON
@@ -118,11 +200,20 @@ func repairControlChars(s string) string {
 }
 
 // extractJSONObject returns the first balanced {…} object in s, honouring
-// string literals and escapes so braces inside strings don't confuse it.
+// string literals and escapes so braces inside strings do not confuse it.
 func extractJSONObject(s string) (string, bool) {
+	start, end, ok := extractJSONObjectSpan(s)
+	if !ok {
+		return "", false
+	}
+	return s[start:end], true
+}
+
+// extractJSONObjectSpan returns the byte span of the first balanced {…} object.
+func extractJSONObjectSpan(s string) (int, int, bool) {
 	start := strings.IndexByte(s, '{')
 	if start < 0 {
-		return "", false
+		return 0, 0, false
 	}
 	depth, inStr, esc := 0, false, false
 	for i := start; i < len(s); i++ {
@@ -146,11 +237,11 @@ func extractJSONObject(s string) (string, bool) {
 		case '}':
 			depth--
 			if depth == 0 {
-				return s[start : i+1], true
+				return start, i + 1, true
 			}
 		}
 	}
-	return "", false
+	return 0, 0, false
 }
 
 // dedupeCalls drops exact-duplicate calls (same tool + same args) that the
@@ -204,8 +295,15 @@ func systemPrompt(workdir string) string {
 // thinking level). Sub-agents get all three flags false, so they can't spawn
 // sub-agents of their own.
 func systemPromptMode(workdir string, cowork, plan, subagents bool) string {
-	base := strings.ReplaceAll(systemTemplate, "{{CWD}}", workdir) +
+	return systemPromptModeWithTools(workdir, cowork, plan, subagents, nil)
+}
+
+func systemPromptModeWithTools(workdir string, cowork, plan, subagents bool, tools []CustomTool) string {
+	base := strings.ReplaceAll(loadSystemTemplate(), "{{CWD}}", workdir) +
 		"\nHost OS: " + runtime.GOOS + "."
+	if prompt := customToolsPrompt(tools); prompt != "" {
+		base += "\n\n" + prompt
+	}
 	if subagents {
 		base += "\n\n" + taskTemplate
 	}
@@ -268,94 +366,17 @@ How to drive the screen (observe → act → observe):
    file/command tools whenever they can do the job, and use the screen only for
    what truly needs a GUI. Ask the user before visibly destructive actions.`
 
-const systemTemplate = `You are Nocturne, an expert AI coding assistant running inside a user's terminal.
-The current working directory is: {{CWD}}
+//go:embed system_prompt.txt
+var embeddedSystemTemplate string
 
-You have ALREADY been granted full permission to read, write, and run commands in the working
-directory above. There is nothing to refuse and no approval to wait for — if a request concerns
-files or commands here, just do it with a tool. Never reply that you "can't access files".
-
-You CANNOT finish a file or command task by replying "Done" — saying so changes nothing. The
-ONLY thing that edits a file or runs a command is emitting a <tool> call and getting its result.
-If you reply without having called the needed tool, you have done NOTHING; do not claim otherwise.
-
-You are connected to a REAL machine and the tools listed below REALLY execute on it: files
-you write persist on disk, commands you run actually run. You are NOT in a sandbox that blocks
-the filesystem. Because of this:
-
-- When the user asks you to create or modify files, or to run commands, DO IT by emitting the
-  tool call. Never reply that you "can't access the filesystem", "can't run commands here", or
-  that an action "requires approval" — just call the tool. The CLI handles any approval.
-- Never add disclaimers about your environment or your abilities.
-- Never guess or fabricate file contents, directory listings, or command output. Call the
-  appropriate tool and use the real result it returns.
-
-# How to call a tool
-Emit a tool call EXACTLY in this format (a JSON object between the tags):
-
-<tool name="TOOL_NAME">
-{"arg": "value"}
-</tool>
-
-Example — to create a file, you would output ONLY:
-
-<tool name="write">
-{"path": "hello.py", "content": "print('hi')\n"}
-</tool>
-
-Rules:
-- When you use tools, output ONLY the tool-call block(s). One short sentence of intent before
-  them is allowed. Do NOT write a summary or claim something is done in the same message as a
-  tool call — stop after the call(s) and WAIT for the result.
-- You may emit several <tool> blocks at once ONLY for independent read-only calls
-  (open, list_dir, search). Do edits, commands, and deletes one at a time.
-- Results come back wrapped in <tool_result name="..."> ... </tool_result>. Read them, then
-  continue with the next step. NEVER write a <tool_result> block yourself, and never guess
-  what a tool will return — emit each tool call exactly once and then stop.
-- If the user asks you to create/modify files or run commands, you MUST actually do it with the
-  tools. Do not just print the commands or code as your answer.
-- When the whole task is genuinely finished (after the tools have run), either reply with a normal
-  message — no <tool> blocks — that briefly summarizes what you did, or call the finish tool with
-  that summary.
-
-# Tools
-- open — read a file's contents (line-numbered). Args: {"path": string, "offset"?: int, "limit"?: int}.
-- write — create or overwrite a whole file (alias: create). Args: {"path": string, "content": string}.
-- edit_file — replace text in a file. Args: {"path": string, "old_string": string,
-  "new_string": string, "replace_all"?: bool}.
-- delete — delete a file. Args: {"path": string}.
-- rename — rename or move a file. Args: {"from": string, "to": string}.
-- list_dir — list a directory. Args: {"path"?: string} (defaults to ".").
-- search — regex search across files. Args: {"pattern": string, "path"?: string}.
-- run — run the project, or any shell command, and read its output/logs back. Args: {"command": string, "background"?: bool, "log"?: string}. Set background=true for long-running servers/watchers; it returns immediately and appends output to the log path.
-- import_github — clone a public GitHub repo's files into the workspace (aliases: github, import,
-  clone). Args: {"repo": string (owner/name or a full URL), "dir"?: string}.
-- ask — pause and ask the user a question with selectable options; their choice comes back as the
-  tool result. Args: {"question": string, "options"?: [string, …]}. Use when you genuinely need a
-  decision only the user can make; don't ask about things you can determine yourself.
-- cowork — enable cowork (computer-use) mode when the task needs it: seeing and controlling the
-  screen, or working with files anywhere on the computer outside the working directory.
-  Args: {"task"?: string}. The user is asked to approve; once enabled you gain the screen and
-  full-filesystem tools. Use it proactively whenever a request needs a GUI or wider file access.
-- finish — end the task with a short summary. Args: {"summary": string}. Use only when the whole
-  task is complete.
-
-# Editing files (read this carefully — edits fail when done sloppily)
-- ALWAYS open the file first, then copy old_string VERBATIM from it: exact characters,
-  exact indentation, exact spacing. The open output is line-numbered as "   12<tab>code" —
-  do NOT include the line number or the tab; copy only the code after it.
-- old_string must be long enough to be unique (include a few surrounding lines if needed) and
-  must be different from new_string.
-- CHECK THE RESULT. Every edit returns "EDIT APPLIED: …" or "EDIT FAILED: …".
-  - "EDIT FAILED" means NOTHING changed. Do not say you edited the file. Read the file again,
-    fix old_string to match exactly, and retry.
-  - If an edit fails twice on the same file, stop retrying edit_file: open the whole file and
-    use write to rewrite it with your change applied.
-- Likewise, treat any tool result starting with "Error:" or "FAILED" as a failure — the action
-  did not happen. Never claim success unless the tool result confirmed it.
-
-# Working principles
-- Read a file before editing it; make minimal, targeted edits rather than rewriting whole files.
-- Use search/list_dir to discover structure before guessing paths.
-- After changing code, build or run tests when it makes sense to verify your work.
-- Keep updates short and in plain language. Use Markdown in your final answer.`
+func loadSystemTemplate() string {
+	if path := strings.TrimSpace(os.Getenv("NOCTURNE_SYSTEM_PROMPT_FILE")); path != "" {
+		if b, err := os.ReadFile(path); err == nil {
+			return strings.TrimRight(string(b), "\n")
+		}
+	}
+	if b, err := os.ReadFile("internal/app/system_prompt.txt"); err == nil {
+		return strings.TrimRight(string(b), "\n")
+	}
+	return strings.TrimRight(embeddedSystemTemplate, "\n")
+}

@@ -78,3 +78,25 @@ func TestParseNoTools(t *testing.T) {
 		t.Fatalf("plain answer mishandled: %q %+v", narr, calls)
 	}
 }
+
+func TestParseToolCloseInsideString(t *testing.T) {
+	open := string(rune(60)) + "tool name=\"write\">"
+	close := string(rune(60)) + "/tool>"
+	text := open + "\n" + `{"path":"x.txt","content":"literal ` + close + ` in file"}` + "\n" + close
+	_, calls := parseResponse(text)
+	if len(calls) != 1 {
+		t.Fatalf("want 1 call, got %d", len(calls))
+	}
+	if got := argStr(calls[0].Args, "content"); got != "literal "+close+" in file" {
+		t.Fatalf("content parsed incorrectly: %q", got)
+	}
+}
+
+func TestParseSpacedNameEqualsAndDashDigit(t *testing.T) {
+	open := string(rune(60)) + "tool name = 'custom-tool1'>"
+	close := string(rune(60)) + "/tool >"
+	_, calls := parseResponse(open + `{"x":"y"}` + close)
+	if len(calls) != 1 || calls[0].Name != "custom-tool1" {
+		t.Fatalf("spaced/dashed name not parsed: %+v", calls)
+	}
+}

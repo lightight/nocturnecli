@@ -72,6 +72,8 @@ func canonicalTool(name string) string {
 		return "run_command"
 	case "github", "import", "clone":
 		return "import_github"
+	case "install", "skill", "skill_install", "install_tool":
+		return "install_skill"
 	case "agent", "subagent", "spawn":
 		return "task"
 	}
@@ -82,7 +84,7 @@ func canonicalTool(name string) string {
 // confirmed by the user (unless auto-accept is on).
 func needsApproval(name string) bool {
 	switch canonicalTool(name) {
-	case "write_file", "edit_file", "run_command", "delete", "rename", "import_github",
+	case "write_file", "edit_file", "run_command", "delete", "rename", "import_github", "install_skill",
 		"click", "move_mouse", "scroll", "type_text", "key_press", "open_app", "task":
 		return true
 	}
@@ -137,6 +139,8 @@ func (tc ToolCall) summarize() string {
 		return fmt.Sprintf("rename(%s → %s)", argStr(tc.Args, "from"), argStr(tc.Args, "to"))
 	case "import_github":
 		return fmt.Sprintf("import_github(%s)", repoArg(tc.Args))
+	case "install_skill":
+		return fmt.Sprintf("install_skill(%s)", skillURLArg(tc.Args))
 	case "ask":
 		return "ask: " + oneLine(argStr(tc.Args, "question"), 70)
 	case "cowork":
@@ -198,6 +202,8 @@ func (tc ToolCall) details(workdir string) string {
 		return fmt.Sprintf("%s → %s", argStr(tc.Args, "from"), argStr(tc.Args, "to"))
 	case "import_github":
 		return "git clone " + normalizeRepoURL(repoArg(tc.Args)) + " (public repo)"
+	case "install_skill":
+		return "install skill/tool from " + skillURLArg(tc.Args)
 	case "cowork":
 		if t := argStr(tc.Args, "task"); t != "" {
 			return "enable computer use for: " + t
@@ -255,6 +261,8 @@ func execute(tc ToolCall, workdir string) string {
 		return renameFileTool(workdir, tc.Args)
 	case "import_github":
 		return importGithubTool(workdir, tc.Args)
+	case "install_skill":
+		return "the install_skill tool is handled by the agent loop and can't run here."
 	case "screenshot":
 		out, _ := screenshotTool()
 		return out
@@ -299,6 +307,13 @@ func execute(tc ToolCall, workdir string) string {
 // so a text-only model can still drive the screen. describe may be nil, in
 // which case a non-vision model gets a refusal.
 func executeWithImage(tc ToolCall, workdir string, vision bool, describe func(Image) (string, error)) (string, *Image) {
+	return executeWithImageWithTools(tc, workdir, vision, describe, nil)
+}
+
+func executeWithImageWithTools(tc ToolCall, workdir string, vision bool, describe func(Image) (string, error), tools []CustomTool) (string, *Image) {
+	if t, ok := findCustomTool(tools, tc.Name); ok {
+		return executeCustomTool(workdir, t, tc.Args), nil
+	}
 	if canonicalTool(tc.Name) != "screenshot" {
 		return execute(tc, workdir), nil
 	}

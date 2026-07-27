@@ -31,7 +31,7 @@ func runSubagent(ctx context.Context, cfg *Config, client *Client, workdir, prom
 	sub := *client
 	sub.cfg = &subCfg
 
-	system := systemPromptMode(workdir, false, false, false)
+	system := systemPromptModeWithTools(workdir, false, false, false, subCfg.Tools)
 	msgs := []ChatMessage{{Role: "user", Content: prompt}}
 
 	var lastNarration string
@@ -70,9 +70,13 @@ func runSubagent(ctx context.Context, cfg *Config, client *Client, workdir, prom
 				}
 				return report, nil
 			}
-			out, img := executeWithImage(tc, workdir, sub.supportsVision(subCfg.Model), func(im Image) (string, error) {
+			if canonicalTool(tc.Name) == "install_skill" {
+				results = append(results, toolResult{Name: tc.Name, Output: installSkillTool(&subCfg, tc.Args)})
+				continue
+			}
+			out, img := executeWithImageWithTools(tc, workdir, sub.supportsVision(subCfg.Model), func(im Image) (string, error) {
 				return sub.DescribeScreenshot(ctx, VisionModel, im)
-			})
+			}, subCfg.Tools)
 			if img != nil {
 				images = append(images, *img)
 			}

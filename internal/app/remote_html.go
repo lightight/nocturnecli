@@ -187,8 +187,8 @@ let busy = false;
 	  sendBtn.textContent = b ? 'Stop' : 'Send';
 	  sendBtn.classList.toggle('stop', b);
 	  if(b){
-	    inp.disabled = true;
-	    inp.placeholder = 'Nocturne is thinking…  (your messages will be queued)';
+	    inp.disabled = false;
+	    inp.placeholder = 'Nocturne is thinking…  (/ commands run now, messages queue)';
 	  } else {
 	    inp.disabled = false;
 	    inp.placeholder = 'Message your terminal session…  (/ for commands)';
@@ -276,7 +276,6 @@ const COMMANDS = [
 	  {name:'/btw',        desc:'by the way — add a note without breaking flow'},
 	  {name:'/key',        desc:'save your API key (remembered everywhere)'},
 	  {name:'/image',      desc:'attach an image file — /image <path>'},
-	  {name:'/mouse',      desc:'capture the mouse for wheel scrolling (off = native text selection)'},
 	  {name:'/cd',         desc:'change the working directory'},
 	  {name:'/usage',      desc:'usage & quota — sent as a text summary'},
 	  {name:'/cowork',     desc:'computer use — see & control this computer'},
@@ -331,7 +330,7 @@ async function sendMsg(){
   post(JSON.stringify({text}));
 }
 sendBtn.addEventListener('click', () => {
-  if(busy){ post(JSON.stringify({kind:'interrupt'})); return; }
+  if(busy && !inp.value.trim().startsWith('/')){ post(JSON.stringify({kind:'interrupt'})); return; }
   sendMsg();
 });
 inp.addEventListener('input', () => {

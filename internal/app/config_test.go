@@ -27,6 +27,16 @@ func TestKeyRoundTrip(t *testing.T) {
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(data), "noct_secret_abcd1234") {
+		t.Fatalf("saved config leaked plaintext API key: %s", data)
+	}
+	if !strings.Contains(string(data), "api_key_enc") {
+		t.Fatalf("saved config should contain encrypted API key field: %s", data)
+	}
 
 	got := loadConfig(path)
 	if got.APIKey != "noct_secret_abcd1234" {
@@ -57,6 +67,32 @@ func TestPersistKeyPromotesEnvKey(t *testing.T) {
 	}
 	if got := loadConfig(path); got.APIKey != "noct_from_env_key99" {
 		t.Fatalf("PersistKey should persist the key, got %q", got.APIKey)
+	}
+}
+
+func TestLegacyPlaintextKeyMigratesToEncrypted(t *testing.T) {
+	neutralizeEnvKeys(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"api_key":"noct_legacy_secret","model":"gpt-5.5"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := loadConfig(path)
+	if cfg.APIKey != "noct_legacy_secret" {
+		t.Fatalf("legacy plaintext key did not load, got %q", cfg.APIKey)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(data), "noct_legacy_secret") || strings.Contains(string(data), "\"api_key\"") {
+		t.Fatalf("legacy plaintext key was not migrated out of config: %s", data)
+	}
+	if got := loadConfig(path); got.APIKey != "noct_legacy_secret" {
+		t.Fatalf("migrated encrypted key did not load, got %q", got.APIKey)
 	}
 }
 

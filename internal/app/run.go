@@ -156,7 +156,7 @@ func runHeadless(cfg *Config, prompt string, cowork bool) error {
 
 	const maxRounds = 30
 	for round := 0; round < maxRounds; round++ {
-		res, err := client.Chat(context.Background(), systemPromptMode(work, cowork, false, cfg.Level == "extended"), msgs)
+		res, err := client.Chat(context.Background(), systemPromptModeWithTools(work, cowork, false, cfg.Level == "extended", cfg.Tools), msgs)
 		if err != nil {
 			return err
 		}
@@ -204,9 +204,13 @@ func runHeadless(cfg *Config, prompt string, cowork bool) error {
 				}
 				continue
 			}
-			out, img := executeWithImage(tc, work, client.supportsVision(cfg.Model), func(im Image) (string, error) {
+			if canonicalTool(tc.Name) == "install_skill" {
+				results = append(results, toolResult{Name: tc.Name, Output: installSkillTool(cfg, tc.Args)})
+				continue
+			}
+			out, img := executeWithImageWithTools(tc, work, client.supportsVision(cfg.Model), func(im Image) (string, error) {
 				return client.DescribeScreenshot(context.Background(), VisionModel, im)
-			})
+			}, cfg.Tools)
 			if img != nil {
 				images = append(images, *img)
 			}

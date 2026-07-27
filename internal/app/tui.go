@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -56,8 +57,11 @@ var slashCommands = []slashItem{
 	{"/level", "thinking: off · normal · extended"},
 	{"/permissions", "how tool actions are approved (ask · auto · bypass)"},
 	{"/key", "save your API key (remembered everywhere)"},
+	{"/tools", "list installed custom tools"},
+	{"/tool-import", "install custom tools from a provider JSON path/URL"},
+	{"/tool-add", "install one custom shell tool"},
+	{"/tool-remove", "remove an installed custom tool"},
 	{"/image", "attach an image file"},
-	{"/mouse", "capture the mouse for wheel scrolling (off = native text selection)"},
 	{"/cd", "change the working directory"},
 	{"/usage", "usage dashboard — status · usage · stats"},
 	{"/cowork", "computer use — see & control this computer"},
@@ -88,7 +92,6 @@ type tuiModel struct {
 	width, height int
 	ready         bool
 	follow        bool // keep the transcript pinned to the bottom
-	mouseOn       bool // mouse capture enabled for wheel scrolling; off preserves text selection
 
 	mode     mode
 	spinning bool
@@ -356,10 +359,10 @@ func startTUI(cfg *Config, version string, cowork bool) error {
 
 	m := newModel(cfg, version)
 	m.cowork = cowork
-	// Mouse capture starts OFF so drag-select / right-click copy & paste keep
-	// working natively; /mouse turns capture on for terminals whose wheel
-	// doesn't fall back to arrow keys in the alt screen.
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(filterLeaks))
+	// Mouse is always enabled so wheel scrolling works in the alt screen. We only
+	// handle wheel events and ignore drag/release events so terminals can still
+	// use their native text selection behavior where supported.
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithFilter(filterLeaks))
 	m.program = p
 	_, err := p.Run()
 	m.remote.Stop()
@@ -556,11 +559,9 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleRemoteSubmit(msg)
 
 	case tea.MouseMsg:
-		if !m.mouseOn {
-			return m, nil
-		}
 		// Route the mouse wheel to the transcript so scrolling up reveals
-		// earlier output (the alt-screen has no native scrollback).
+		// earlier output (the alt-screen has no native scrollback). Other mouse
+		// events are ignored so drag selection remains controlled by the terminal.
 		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
 			var cmd tea.Cmd
 			m.vp, cmd = m.vp.Update(msg)
@@ -584,12 +585,11 @@ func (m *tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.follow = m.vp.AtBottom()
 		return m, cmd
 	case tea.KeyUp, tea.KeyDown:
-		// With mouse capture off (the default) most terminals report the
-		// wheel as Up/Down keys in the alt screen. Route arrows to the
-		// transcript wherever they can't do anything else: in the input when
-		// it has a single line (arrows can't move the cursor there) and no
-		// "/" menu is open. While the bot is busy, still let arrows edit a
-		// multi-line draft; otherwise they keep scrolling the transcript.
+		// Route arrows to the transcript wherever they can't do anything else:
+		// in the input when it has a single line (arrows can't move the cursor
+		// there) and no "/" menu is open. While the bot is busy, still let
+		// arrows edit a multi-line draft; otherwise they keep scrolling the
+		// transcript.
 		busy := m.mode == modeThinking || m.mode == modeStreaming
 		idleInput := m.mode == modeInput && !m.showSlash && !strings.Contains(m.ta.Value(), "\n")
 		busySingleLineDraft := busy && !strings.Contains(m.ta.Value(), "\n")
@@ -850,9 +850,9 @@ func (m *tuiModel) handleDashKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *tuiModel) handleBusyInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Let the user prepare the next message while the model is thinking,
-	// streaming, or running tools. Enter queues the draft so it runs as soon as
-	// the current agent turn settles; it must not start a second request now.
+	// Let the user prepare input while the model is thinking, streaming, or
+	// running tools. Slash commands execute immediately; normal messages queue
+	// until the current agent turn settles so we don't start a second request.
 	if msg.Paste {
 		if img, ok := tryPasteImage(string(msg.Runes), m.work); ok {
 			m.attachments = append(m.attachments, img)
@@ -1074,6 +1074,9 @@ func (m *tuiModel) queueBusyDraft() (tea.Model, tea.Cmd) {
 	m.ta.Reset()
 	m.showSlash = false
 	m.refreshSlash()
+	if strings.HasPrefix(raw, "/") {
+		return m.runSlash(raw, false)
+	}
 	m.queueText(raw)
 	return m, nil
 }
@@ -1152,7 +1155,7 @@ func (m *tuiModel) startStream() tea.Cmd {
 	m.streamBuf = ""
 	ch := make(chan StreamEvent, 128)
 	m.streamCh = ch
-	go m.client.ChatStream(ctx, systemPromptMode(m.work, m.cowork, m.plan, m.cfg.Level == "extended"), append([]ChatMessage(nil), m.messages...), ch)
+	go m.client.ChatStream(ctx, systemPromptModeWithTools(m.work, m.cowork, m.plan, m.cfg.Level == "extended", m.cfg.Tools), append([]ChatMessage(nil), m.messages...), ch)
 	return tea.Batch(m.startSpinner(), waitDelta(ch))
 }
 
@@ -1169,7 +1172,7 @@ func waitDelta(ch chan StreamEvent) tea.Cmd {
 func (m *tuiModel) callAPICmd() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
-	system := systemPromptMode(m.work, m.cowork, m.plan, m.cfg.Level == "extended")
+	system := systemPromptModeWithTools(m.work, m.cowork, m.plan, m.cfg.Level == "extended", m.cfg.Tools)
 	msgs := append([]ChatMessage(nil), m.messages...)
 	client := m.client
 	return func() tea.Msg {
@@ -1193,6 +1196,20 @@ func (m *tuiModel) runToolCmd(tc ToolCall) tea.Cmd {
 	if canonicalTool(tc.Name) == "task" {
 		return m.runTaskCmd(tc)
 	}
+	if canonicalTool(tc.Name) == "install_skill" {
+		cfg := m.cfg
+		return func() tea.Msg {
+			out := installSkillTool(cfg, tc.Args)
+			return toolDoneMsg{name: tc.Name, output: out}
+		}
+	}
+	if t, ok := findCustomTool(m.cfg.Tools, tc.Name); ok {
+		work := m.work
+		return func() tea.Msg {
+			out := executeCustomTool(work, t, tc.Args)
+			return toolDoneMsg{name: tc.Name, output: out}
+		}
+	}
 	work := m.work
 	vision := m.currentVision()
 	client := m.client
@@ -1205,7 +1222,7 @@ func (m *tuiModel) runToolCmd(tc ToolCall) tea.Cmd {
 		return client.DescribeScreenshot(ctx, vm, img)
 	}
 	return func() tea.Msg {
-		out, img := executeWithImage(tc, work, vision, describe)
+		out, img := executeWithImageWithTools(tc, work, vision, describe, m.cfg.Tools)
 		add, del := codeChange(tc, out)
 		return toolDoneMsg{name: tc.Name, output: out, image: img, added: add, removed: del}
 	}
@@ -1366,6 +1383,14 @@ func (m *tuiModel) advanceTools() tea.Cmd {
 
 	m.pushToolCall(tc)
 	m.toRemote("tool", "● "+tc.summarize())
+
+	if _, ok := findCustomTool(m.cfg.Tools, tc.Name); ok {
+		m.mode = modeConfirm
+		m.confirm = tc
+		m.guardReason = ""
+		m.toRemote("status", "waiting for approval in the terminal: "+tc.summarize())
+		return nil
+	}
 
 	// The task tool only exists at extended thinking level.
 	if canonicalTool(tc.Name) == "task" && m.cfg.Level != "extended" {
@@ -1837,10 +1862,6 @@ func (m *tuiModel) handleRemoteSubmit(msg remoteSubmitMsg) (tea.Model, tea.Cmd) 
 	if text == "" {
 		return m, nil
 	}
-	if m.busy() {
-		m.queueText(text)
-		return m, nil
-	}
 	if strings.HasPrefix(text, "/") {
 		m.toRemote("user", text)
 		before := len(m.lines)
@@ -1849,6 +1870,10 @@ func (m *tuiModel) handleRemoteSubmit(msg remoteSubmitMsg) (tea.Model, tea.Cmd) 
 			tm.forwardRemoteFeedback(before)
 		}
 		return next, cmd
+	}
+	if m.busy() {
+		m.queueText(text)
+		return m, nil
 	}
 	m.follow = true
 	m.messages = append(m.messages, ChatMessage{Role: "user", Content: text})
@@ -2228,10 +2253,7 @@ func (m *tuiModel) statusLine() string {
 		}
 		return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("streaming… (%s · esc to interrupt)", m.elapsed()))
 	default:
-		scroll := "wheel/pgup/pgdn scroll · drag selects · /mouse capture"
-		if m.mouseOn {
-			scroll = "wheel captured · /mouse to select text"
-		}
+		scroll := "wheel/pgup/pgdn scroll · drag selects"
 		line := "  enter ↵ send · alt+↵ newline · ctrl+v paste image · " + scroll + " · / commands"
 		if m.cowork {
 			line = stAccent.Render("  cowork") + stHint.Render(" · ") + strings.TrimLeft(line, " ")
@@ -2599,6 +2621,63 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 		if m.cfg.keyFromRealEnv {
 			m.push(stHint.Render("  note: NOCTURNE_API is exported in your environment and still overrides the saved key — unset it to use this one"))
 		}
+	case "/tools":
+		m.push(m.customToolsList())
+	case "/install":
+		if arg == "" {
+			m.push(stErr.Render("  usage: /install <skill-url-or-path>"))
+			break
+		}
+		msg, err := installSkill(m.cfg, arg)
+		if err != nil {
+			m.push(stErr.Render("  couldn't install skill: " + err.Error()))
+			break
+		}
+		m.push(stOK.Render("  " + msg))
+	case "/tool-import", "/tools-import":
+		if arg == "" {
+			m.push(stErr.Render("  usage: /tool-import <provider.json path-or-url>"))
+			break
+		}
+		n, err := importToolProvider(m.cfg, arg)
+		if err != nil {
+			m.push(stErr.Render("  couldn't import tools: " + err.Error()))
+			break
+		}
+		if err := m.cfg.Save(); err != nil {
+			m.push(stErr.Render("  imported but couldn't save config: " + err.Error()))
+			break
+		}
+		m.push(stOK.Render(fmt.Sprintf("  installed %d custom tool(s)", n)))
+	case "/tool-remove", "/tools-remove":
+		if arg == "" {
+			m.push(stErr.Render("  usage: /tool-remove <name>"))
+			break
+		}
+		if !m.cfg.RemoveCustomTool(arg) {
+			m.push(stErr.Render("  no custom tool named " + strings.TrimSpace(arg)))
+			break
+		}
+		if err := m.cfg.Save(); err != nil {
+			m.push(stErr.Render("  removed but couldn't save config: " + err.Error()))
+			break
+		}
+		m.push(stOK.Render("  removed custom tool " + strings.TrimSpace(arg)))
+	case "/tool-add", "/tools-add":
+		name, desc, command, toolArgs, ok := parseToolAddArgs(arg)
+		if !ok {
+			m.push(stErr.Render("  usage: /tool-add <name> <command> [--desc text] [--arg name:description ...]"))
+			break
+		}
+		if err := m.cfg.AddCustomTool(CustomTool{Name: name, Description: desc, Command: command, Args: toolArgs, Provider: "manual"}); err != nil {
+			m.push(stErr.Render("  couldn't add tool: " + err.Error()))
+			break
+		}
+		if err := m.cfg.Save(); err != nil {
+			m.push(stErr.Render("  added but couldn't save config: " + err.Error()))
+			break
+		}
+		m.push(stOK.Render("  installed custom tool " + name))
 	case "/update":
 		m.push(stHint.Render("  ⟳ checking for updates…"))
 		return m, updateCmd()
@@ -2648,14 +2727,6 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 			m.follow = true
 			m.syncViewport()
 		}
-	case "/mouse":
-		m.mouseOn = !m.mouseOn
-		if m.mouseOn {
-			m.push(stHint.Render("  mouse on — wheel scrolls the transcript (shift+drag to select in most terminals); /mouse again for native selection"))
-			return m, tea.EnableMouseCellMotion
-		}
-		m.push(stHint.Render("  mouse off — drag to select & copy text; wheel still scrolls in most terminals, PgUp/PgDn always works"))
-		return m, tea.DisableMouse
 	case "/cwd", "/pwd":
 		m.push(stHint.Render("  " + m.work))
 	case "/cd":
@@ -2758,6 +2829,78 @@ func updateCmd() tea.Cmd {
 		text, err := doUpdate(false)
 		return updateDoneMsg{text: text, err: err}
 	}
+}
+
+func (m *tuiModel) customToolsList() string {
+	tools := normalizeCustomTools(m.cfg.Tools)
+	if len(tools) == 0 {
+		return stHint.Render("  no custom tools installed")
+	}
+	var b strings.Builder
+	b.WriteString(stTitle.Render("  Custom tools") + "\n")
+	for _, t := range tools {
+		line := "  " + stAccent.Render(t.Name)
+		if t.Description != "" {
+			line += " " + stDim.Render("— "+t.Description)
+		}
+		b.WriteString(line + "\n")
+		b.WriteString("    " + stDim.Render("command: "+t.Command) + "\n")
+		if len(t.Args) > 0 {
+			keys := make([]string, 0, len(t.Args))
+			for k := range t.Args {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			parts := make([]string, 0, len(keys))
+			for _, k := range keys {
+				parts = append(parts, k+": "+t.Args[k])
+			}
+			b.WriteString("    " + stDim.Render("args: "+strings.Join(parts, ", ")) + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func parseToolAddArgs(arg string) (name, desc, command string, toolArgs map[string]string, ok bool) {
+	fields := strings.Fields(arg)
+	if len(fields) < 2 {
+		return "", "", "", nil, false
+	}
+	name = fields[0]
+	var cmdParts []string
+	toolArgs = map[string]string{}
+	for i := 1; i < len(fields); i++ {
+		switch fields[i] {
+		case "--desc", "--description":
+			i++
+			var parts []string
+			for i < len(fields) && !strings.HasPrefix(fields[i], "--") {
+				parts = append(parts, fields[i])
+				i++
+			}
+			i--
+			desc = strings.Join(parts, " ")
+		case "--arg":
+			i++
+			if i >= len(fields) {
+				return "", "", "", nil, false
+			}
+			k, v, found := strings.Cut(fields[i], ":")
+			k = strings.TrimSpace(k)
+			v = strings.TrimSpace(v)
+			if !found {
+				v = "string"
+			}
+			if k == "" {
+				return "", "", "", nil, false
+			}
+			toolArgs[k] = v
+		default:
+			cmdParts = append(cmdParts, fields[i])
+		}
+	}
+	command = strings.TrimSpace(strings.Join(cmdParts, " "))
+	return name, desc, command, toolArgs, name != "" && command != ""
 }
 
 // ensureModels prepends any of ids not already present (e.g. gpt-5.5, which
