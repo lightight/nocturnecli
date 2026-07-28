@@ -286,19 +286,19 @@ func buildToolResults(results []toolResult) string {
 
 // systemPrompt is the operating manual handed to the model each turn.
 func systemPrompt(workdir string) string {
-	return systemPromptMode(workdir, false, false, false)
+	return systemPromptMode(workdir, false, false, false, false)
 }
 
 // systemPromptMode builds the system prompt, appending the computer-use
 // section when cowork mode is active, the plan-mode section when plan mode is
-// on, and the task (sub-agent) tool when subagents are available (extended
-// thinking level). Sub-agents get all three flags false, so they can't spawn
-// sub-agents of their own.
-func systemPromptMode(workdir string, cowork, plan, subagents bool) string {
-	return systemPromptModeWithTools(workdir, cowork, plan, subagents, nil)
+// on, the goal-mode section for long autonomous tasks, and the task
+// (sub-agent) tool when subagents are available (extended thinking level).
+// Sub-agents get those flags false, so they can't spawn sub-agents of their own.
+func systemPromptMode(workdir string, cowork, plan, goal, subagents bool) string {
+	return systemPromptModeWithTools(workdir, cowork, plan, goal, subagents, nil)
 }
 
-func systemPromptModeWithTools(workdir string, cowork, plan, subagents bool, tools []CustomTool) string {
+func systemPromptModeWithTools(workdir string, cowork, plan, goal, subagents bool, tools []CustomTool) string {
 	base := strings.ReplaceAll(loadSystemTemplate(), "{{CWD}}", workdir) +
 		"\nHost OS: " + runtime.GOOS + "."
 	if prompt := customToolsPrompt(tools); prompt != "" {
@@ -309,6 +309,9 @@ func systemPromptModeWithTools(workdir string, cowork, plan, subagents bool, too
 	}
 	if plan {
 		base += "\n\n" + planTemplate
+	}
+	if goal {
+		base += "\n\n" + goalTemplate
 	}
 	if !cowork {
 		return base
@@ -326,6 +329,21 @@ Plan mode is ON. Your job now is to EXPLORE and PLAN, not to execute.
   concrete step-by-step plan: real files, functions, and commands, in the order to do them.
 - Do NOT call finish with the plan; present it as a normal message and stop.
 - End by telling the user to run /plan again to approve the plan and start executing.`
+
+const goalTemplate = `# Goal mode
+Goal mode is ON. Work autonomously until the user's objective is complete or you are genuinely blocked.
+
+- Long tasks are expected. Keep going across tool results, background-command notifications,
+  failed attempts, retries, and verification loops instead of stopping early.
+- For servers, watchers, polling loops, downloads, scheduled waits, and other long-running
+  commands, prefer run with {"background": true, "log": "..."}. Then inspect the log or
+  wait for the CLI's background-completion result before deciding what to do next.
+- Use the available tools proactively: read files, run tests, curl or query web endpoints,
+  delegate independent chunks with task, and check logs/artifacts until you have evidence.
+- If a tool fails, read the exact tool result, correct the command or JSON syntax, and retry.
+  Do not claim success for failed or unverified work.
+- Do not finish just because work has started in the background. Use finish only after the
+  goal is complete and verified, or when blocked with a clear reason and next step.`
 
 const taskTemplate = `# Sub-agents — the task tool
 - task — delegate a self-contained sub-task to a sub-agent with its own agent loop and full

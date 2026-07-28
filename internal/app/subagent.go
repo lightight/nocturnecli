@@ -18,6 +18,13 @@ const maxSubagentRounds = 15
 // The sub-agent is forced to extended thinking and gets a system prompt with no
 // cowork, no plan mode, and no task tool, so sub-agents can't spawn sub-agents.
 func runSubagent(ctx context.Context, cfg *Config, client *Client, workdir, prompt string) (string, error) {
+	return runSubagentWithLimit(ctx, cfg, client, workdir, prompt, maxSubagentRounds)
+}
+
+func runSubagentWithLimit(ctx context.Context, cfg *Config, client *Client, workdir, prompt string, maxRounds int) (string, error) {
+	if maxRounds <= 0 {
+		maxRounds = maxSubagentRounds
+	}
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return "", fmt.Errorf("sub-agent: task requires a 'prompt'")
@@ -31,11 +38,11 @@ func runSubagent(ctx context.Context, cfg *Config, client *Client, workdir, prom
 	sub := *client
 	sub.cfg = &subCfg
 
-	system := systemPromptModeWithTools(workdir, false, false, false, subCfg.Tools)
+	system := systemPromptModeWithTools(workdir, false, false, false, false, subCfg.Tools)
 	msgs := []ChatMessage{{Role: "user", Content: prompt}}
 
 	var lastNarration string
-	for round := 0; round < maxSubagentRounds; round++ {
+	for round := 0; round < maxRounds; round++ {
 		res, err := sub.Chat(ctx, system, msgs)
 		if err != nil {
 			return "", fmt.Errorf("sub-agent: %w", err)
@@ -84,5 +91,5 @@ func runSubagent(ctx context.Context, cfg *Config, client *Client, workdir, prom
 		}
 		msgs = append(msgs, ChatMessage{Role: "user", Content: buildToolResults(results), Images: images})
 	}
-	return "", fmt.Errorf("sub-agent: reached max %d rounds without finishing", maxSubagentRounds)
+	return "", fmt.Errorf("sub-agent: reached max %d rounds without finishing", maxRounds)
 }

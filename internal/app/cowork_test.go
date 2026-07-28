@@ -213,11 +213,11 @@ func TestShrinkScreenshotSmall(t *testing.T) {
 }
 
 func TestSystemPromptCowork(t *testing.T) {
-	off := systemPromptMode("/tmp/work", false, false, false)
+	off := systemPromptMode("/tmp/work", false, false, false, false)
 	if strings.Contains(off, "screenshot") || strings.Contains(off, "Cowork mode") {
 		t.Error("base prompt should not mention cowork tooling")
 	}
-	on := systemPromptMode("/tmp/work", true, false, false)
+	on := systemPromptMode("/tmp/work", true, false, false, false)
 	for _, want := range []string{"screenshot", "click", "type_text", "ENTIRE filesystem", "observe"} {
 		if !strings.Contains(on, want) {
 			t.Errorf("cowork prompt missing %q", want)

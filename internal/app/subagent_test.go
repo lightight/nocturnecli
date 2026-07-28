@@ -10,11 +10,11 @@ import (
 )
 
 func TestSystemPromptPlanMode(t *testing.T) {
-	off := systemPromptMode("/tmp/work", false, false, false)
+	off := systemPromptMode("/tmp/work", false, false, false, false)
 	if strings.Contains(off, "Plan mode") {
 		t.Error("base prompt should not mention plan mode")
 	}
-	on := systemPromptMode("/tmp/work", false, true, false)
+	on := systemPromptMode("/tmp/work", false, true, false, false)
 	for _, want := range []string{"Plan mode", "read-only", "/plan"} {
 		if !strings.Contains(on, want) {
 			t.Errorf("plan-mode prompt missing %q", want)
@@ -23,11 +23,11 @@ func TestSystemPromptPlanMode(t *testing.T) {
 }
 
 func TestSystemPromptTaskTool(t *testing.T) {
-	off := systemPromptMode("/tmp/work", false, false, false)
+	off := systemPromptMode("/tmp/work", false, false, false, false)
 	if strings.Contains(off, "Sub-agents") {
 		t.Error("base prompt should not advertise the task tool")
 	}
-	on := systemPromptMode("/tmp/work", false, false, true)
+	on := systemPromptMode("/tmp/work", false, false, false, true)
 	for _, want := range []string{"Sub-agents", "task", "sub-agent", "prompt"} {
 		if !strings.Contains(on, want) {
 			t.Errorf("extended-level prompt missing %q", want)

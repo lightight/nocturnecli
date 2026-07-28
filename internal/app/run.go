@@ -156,7 +156,7 @@ func runHeadless(cfg *Config, prompt string, cowork bool) error {
 
 	const maxRounds = 30
 	for round := 0; round < maxRounds; round++ {
-		res, err := client.Chat(context.Background(), systemPromptModeWithTools(work, cowork, false, cfg.Level == "extended", cfg.Tools), msgs)
+		res, err := client.Chat(context.Background(), systemPromptModeWithTools(work, cowork, false, false, cfg.Level == "extended", cfg.Tools), msgs)
 		if err != nil {
 			return err
 		}

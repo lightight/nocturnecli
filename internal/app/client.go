@@ -175,6 +175,8 @@ type StreamEvent struct {
 	Err   error
 }
 
+var ErrStreamClosedEarly = errors.New("stream closed before done event")
+
 // buildBody marshals a request, prepending the system prompt as the first
 // message (the endpoint ignores a top-level "system" field when "messages"
 // is present).
@@ -569,6 +571,7 @@ func (c *Client) ChatStream(ctx context.Context, system string, msgs []ChatMessa
 		return
 	}
 
+	gotDone := false
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
@@ -596,6 +599,7 @@ func (c *Client) ChatStream(ctx context.Context, system string, msgs []ChatMessa
 				out <- StreamEvent{Delta: ev.Text}
 			}
 		case "done":
+			gotDone = true
 			out <- StreamEvent{Done: true, Usage: ev.Usage, Quota: ev.Quota}
 		case "error":
 			out <- StreamEvent{Err: fmt.Errorf("%s", firstNonEmpty(ev.Error, "stream error"))}
@@ -604,6 +608,8 @@ func (c *Client) ChatStream(ctx context.Context, system string, msgs []ChatMessa
 	}
 	if err := sc.Err(); err != nil && ctx.Err() == nil {
 		out <- StreamEvent{Err: err}
+	} else if !gotDone && ctx.Err() == nil {
+		out <- StreamEvent{Err: ErrStreamClosedEarly}
 	}
 }
 

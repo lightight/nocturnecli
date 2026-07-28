@@ -45,6 +45,11 @@ const autoCompactThreshold = 900_000
 // maxInputRows caps how tall the input box can grow as text wraps.
 const maxInputRows = 10
 
+const (
+	goalSubagentTimeout = 8 * time.Hour
+	goalSubagentRounds  = 100
+)
+
 // slashItem is one entry in the "/" command menu.
 type slashItem struct {
 	name string
@@ -66,6 +71,7 @@ var slashCommands = []slashItem{
 	{"/usage", "usage dashboard — status · usage · stats"},
 	{"/cowork", "computer use — see & control this computer"},
 	{"/plan", "plan mode — read-only exploration, approve to execute"},
+	{"/goal", "goal mode — autonomous long-running task mode"},
 	{"/compact", "summarize the conversation to free up context"},
 	{"/resume", "resume a saved chat from this directory"},
 	{"/new", "start a new chat"},
@@ -97,6 +103,7 @@ type tuiModel struct {
 	spinning bool
 	cowork   bool // computer-use mode: screen control + whole filesystem
 	plan     bool // plan mode: read-only exploration until the user approves
+	goal     bool // goal mode: long autonomous tasks with background work
 
 	lines       []string // transcript blocks (the scrollback)
 	messages    []ChatMessage
@@ -1155,7 +1162,7 @@ func (m *tuiModel) startStream() tea.Cmd {
 	m.streamBuf = ""
 	ch := make(chan StreamEvent, 128)
 	m.streamCh = ch
-	go m.client.ChatStream(ctx, systemPromptModeWithTools(m.work, m.cowork, m.plan, m.cfg.Level == "extended", m.cfg.Tools), append([]ChatMessage(nil), m.messages...), ch)
+	go m.client.ChatStream(ctx, systemPromptModeWithTools(m.work, m.cowork, m.plan, m.goal, m.cfg.Level == "extended", m.cfg.Tools), append([]ChatMessage(nil), m.messages...), ch)
 	return tea.Batch(m.startSpinner(), waitDelta(ch))
 }
 
@@ -1172,7 +1179,7 @@ func waitDelta(ch chan StreamEvent) tea.Cmd {
 func (m *tuiModel) callAPICmd() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
-	system := systemPromptModeWithTools(m.work, m.cowork, m.plan, m.cfg.Level == "extended", m.cfg.Tools)
+	system := systemPromptModeWithTools(m.work, m.cowork, m.plan, m.goal, m.cfg.Level == "extended", m.cfg.Tools)
 	msgs := append([]ChatMessage(nil), m.messages...)
 	client := m.client
 	return func() tea.Msg {
@@ -1238,9 +1245,15 @@ func (m *tuiModel) runTaskCmd(tc ToolCall) tea.Cmd {
 	work := m.work
 	prompt := argStr(tc.Args, "prompt")
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		timeout := 10 * time.Minute
+		maxRounds := maxSubagentRounds
+		if m.goal {
+			timeout = goalSubagentTimeout
+			maxRounds = goalSubagentRounds
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		report, err := runSubagent(ctx, cfg, client, work, prompt)
+		report, err := runSubagentWithLimit(ctx, cfg, client, work, prompt, maxRounds)
 		if err != nil {
 			return toolDoneMsg{name: tc.Name, output: "Error: " + oneLine(err.Error(), 400)}
 		}
@@ -1274,6 +1287,9 @@ func (m *tuiModel) handleAPIResp(msg apiRespMsg) (tea.Model, tea.Cmd) {
 func (m *tuiModel) handleStreamDelta(msg streamDeltaMsg) (tea.Model, tea.Cmd) {
 	ev := msg.ev
 	if ev.Err != nil {
+		if cmd := m.recoverStreamError(ev.Err); cmd != nil {
+			return m, cmd
+		}
 		m.replyError(ev.Err)
 		return m, m.settleIdleCmd()
 	}
@@ -2084,24 +2100,125 @@ func (m *tuiModel) viewportHeight() int {
 }
 
 // streamPreview cleans in-flight streamed text for live display: complete or
-// still-open <tool> blocks become a tidy "● preparing tool call…" line instead
-// of the raw "<tool name=…" tags scrolling by.
-// cleanToolStream replaces complete or partial <tool> blocks in the in-flight
-// text with marker, so neither the terminal nor the browser shows raw tags.
+// still-open tool blocks become a tidy "● preparing tool call…" line instead
+// of raw tool tags scrolling by.
+// cleanToolStream scans instead of regex-replacing so huge tool arguments never
+// grow the visible preview and partial blocks are hidden immediately.
 func cleanToolStream(buf, marker string) string {
-	const ph = "\x00TOOLCALL\x00"
-	buf = toolBlock.ReplaceAllString(buf, ph)
-	buf = toolBlockAlt.ReplaceAllString(buf, ph)
-	buf = resultBlock.ReplaceAllString(buf, "")
-	if i := strings.Index(buf, "<tool"); i >= 0 {
-		buf = buf[:i] + ph
+	lower := strings.ToLower(buf)
+	openResult := toolOpenTag + "_result"
+	resultClose := string(rune(60)) + "/tool_result>"
+	var b strings.Builder
+	for pos := 0; pos < len(buf); {
+		i := strings.Index(lower[pos:], toolOpenTag)
+		if i < 0 {
+			b.WriteString(buf[pos:])
+			break
+		}
+		i += pos
+		b.WriteString(buf[pos:i])
+
+		if strings.HasPrefix(lower[i:], openResult) {
+			close := strings.Index(lower[i:], resultClose)
+			if close < 0 {
+				pos = len(buf)
+			} else {
+				pos = i + close + len(resultClose)
+			}
+			continue
+		}
+
+		b.WriteString(marker)
+		gtRel := strings.IndexByte(buf[i:], '>')
+		if gtRel < 0 {
+			pos = len(buf)
+			break
+		}
+		bodyStart := i + gtRel + 1
+		_, closeEnd := findCloseToolTag(buf, bodyStart)
+		if closeEnd < 0 {
+			pos = len(buf)
+			break
+		}
+		pos = closeEnd
 	}
-	buf = strings.ReplaceAll(buf, ph, marker)
-	return strings.TrimRight(buf, " \n")
+	return strings.TrimRight(b.String(), " \n")
 }
 
 func streamPreview(buf string) string {
 	return cleanToolStream(buf, stAccent.Render("●")+" "+stDim.Render("preparing tool call…"))
+}
+
+func (m *tuiModel) recoverStreamError(err error) tea.Cmd {
+	if !errors.Is(err, ErrStreamClosedEarly) || strings.TrimSpace(m.streamBuf) == "" {
+		return nil
+	}
+	text := m.streamBuf
+	m.cancel = nil
+	m.streamCh = nil
+	m.streamBuf = ""
+
+	narration, calls := parseResponse(text)
+	if len(calls) > 0 {
+		m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: text})
+		if narration != "" {
+			m.push(m.renderAssistant(narration))
+			m.toRemote("stream", narration)
+		}
+		m.push(stHint.Render("  ↻ stream ended early — recovered complete tool call(s)"))
+		m.pending = calls
+		m.results = nil
+		return m.advanceTools()
+	}
+	if hasIncompleteToolBlock(text) {
+		m.push(stHint.Render("  ↻ stream ended mid-tool-call — asking the model to resend it"))
+		m.messages = append(m.messages, ChatMessage{Role: "user", Content: toolCallRecoveryPrompt(text)})
+		return m.startReply()
+	}
+	return nil
+}
+
+func hasIncompleteToolBlock(text string) bool {
+	lower := strings.ToLower(text)
+	openResult := toolOpenTag + "_result"
+	for pos := 0; pos < len(text); {
+		i := strings.Index(lower[pos:], toolOpenTag)
+		if i < 0 {
+			return false
+		}
+		i += pos
+		if strings.HasPrefix(lower[i:], openResult) {
+			pos = i + len(toolOpenTag)
+			continue
+		}
+		gtRel := strings.IndexByte(text[i:], '>')
+		if gtRel < 0 {
+			return true
+		}
+		bodyStart := i + gtRel + 1
+		_, closeEnd := findCloseToolTag(text, bodyStart)
+		if closeEnd < 0 {
+			return true
+		}
+		pos = closeEnd
+	}
+	return false
+}
+
+func toolCallRecoveryPrompt(text string) string {
+	name := ""
+	if i := strings.LastIndex(strings.ToLower(text), toolOpenTag); i >= 0 {
+		if gt := strings.IndexByte(text[i:], '>'); gt >= 0 {
+			name, _ = parseToolStartName(text[i : i+gt+1])
+		} else if m := toolStartName.FindStringSubmatch(text[i:]); len(m) == 2 {
+			name = m[1]
+		}
+	}
+	which := ""
+	if name != "" {
+		which = " for " + name
+	}
+	return "Your previous tool call" + which + " was incomplete because the stream ended before a closing tool tag, so no tool ran. Re-send exactly one complete tool block with one valid JSON object and a closing tool tag. Do not include prose before the tool call."
 }
 
 // --- views -----------------------------------------------------------------
@@ -2540,6 +2657,15 @@ func (m *tuiModel) rebuildRenderer() {
 
 func (m *tuiModel) elapsed() time.Duration { return time.Since(m.started).Truncate(time.Second) }
 
+func (m *tuiModel) enableGoalMode() {
+	if m.cfg.Level != "extended" {
+		m.cfg.Level = "extended"
+		_ = m.cfg.Save()
+	}
+	m.push(stOK.Render("  goal mode on — autonomous long-running tasks enabled"))
+	m.push(stHint.Render("  thinking level set to extended; use /goal off to disable goal mode"))
+}
+
 // --- slash commands --------------------------------------------------------
 
 func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
@@ -2760,6 +2886,23 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 		} else {
 			m.push(stOK.Render("  plan approved — executing"))
 			return m.submitText("Plan approved — go ahead and implement it.")
+		}
+	case "/goal":
+		switch strings.ToLower(arg) {
+		case "off", "stop", "false", "0":
+			m.goal = false
+			m.push(stHint.Render("  goal mode off"))
+		case "", "on", "start", "true", "1":
+			m.goal = !m.goal
+			if m.goal {
+				m.enableGoalMode()
+			} else {
+				m.push(stHint.Render("  goal mode off"))
+			}
+		default:
+			m.goal = true
+			m.enableGoalMode()
+			return m.submitText(arg)
 		}
 	case "/usage", "/tokens", "/stats", "/status":
 		if remote {
