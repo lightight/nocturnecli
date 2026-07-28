@@ -526,8 +526,12 @@ const taskTemplate = `# Sub-agents — the task tool
   live grid with each sub-agent's progress while they run.
   Use it for independent chunks of work that need many steps; each sub-agent runs with extended
   thinking and its final report comes back as the tool result. Do not delegate work you can
-  do yourself in a step or two, and make every prompt fully self-contained — the sub-agents
-  can't see this conversation.`
+  do yourself in a step or two.
+  When the user asks for generic, separate, or unspecified sub-agent prompts/questions, keep them
+  generic or ask the user for topics. Do NOT anchor those prompts to prior files, prior tasks, or
+  recent conversation context unless the user explicitly asks for that connection.
+  Make every sub-agent prompt fully self-contained, including only the context that is necessary
+  for the specific sub-task, because sub-agents can't see this conversation.`
 
 const coworkTemplate = `# Cowork mode — computer use
 Cowork mode is ON. You are no longer confined to the working directory: you may

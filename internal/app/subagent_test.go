@@ -33,6 +33,11 @@ func TestSystemPromptTaskTool(t *testing.T) {
 			t.Errorf("extended-level prompt missing %q", want)
 		}
 	}
+	for _, want := range []string{"Do NOT anchor", "prior files", "prior tasks", "recent conversation context", "unless the user explicitly asks"} {
+		if !strings.Contains(on, want) {
+			t.Errorf("sub-agent prompt missing anti-anchoring guidance %q", want)
+		}
+	}
 }
 
 func TestTaskSpecsFromArgs(t *testing.T) {
