@@ -458,9 +458,10 @@ func startTUI(cfg *Config, version string, cowork bool) error {
 
 	m := newModel(cfg, version)
 	m.cowork = cowork
-	// Leave terminal mouse reporting disabled so native click-drag text selection
-	// works. Scrolling is handled by the terminal/viewport keybindings instead.
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(filterLeaks))
+	// Enable terminal mouse reporting so wheel events reach the viewport while in
+	// the alt-screen (which has no native scrollback). Non-wheel mouse events are
+	// ignored in Update so clicks don't affect the UI.
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithFilter(filterLeaks))
 	m.program = p
 	_, err := p.Run()
 	m.remote.Stop()
