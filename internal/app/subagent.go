@@ -42,6 +42,8 @@ func runSubagentWithLimit(ctx context.Context, cfg *Config, client *Client, work
 	msgs := []ChatMessage{{Role: "user", Content: prompt}}
 
 	var lastNarration string
+	emptyNudges := 0
+	var badCalls badCallBreaker
 	for round := 0; round < maxRounds; round++ {
 		res, err := sub.Chat(ctx, system, msgs)
 		if err != nil {
@@ -53,10 +55,16 @@ func runSubagentWithLimit(ctx context.Context, cfg *Config, client *Client, work
 		if len(calls) == 0 {
 			report := strings.TrimSpace(narration)
 			if report == "" {
+				if emptyNudges < maxEmptyNudges {
+					emptyNudges++
+					msgs = append(msgs, ChatMessage{Role: "user", Content: emptyReplyNudge})
+					continue
+				}
 				return "", fmt.Errorf("sub-agent: finished without a report")
 			}
 			return report, nil
 		}
+		emptyNudges = 0
 		if narration != "" {
 			lastNarration = narration
 		}
@@ -64,6 +72,14 @@ func runSubagentWithLimit(ctx context.Context, cfg *Config, client *Client, work
 		var results []toolResult
 		var images []Image
 		for _, tc := range calls {
+			if out, bad := diagnoseBadToolCall(tc, subCfg.Tools); bad {
+				if badCalls.add(tc) {
+					return "", fmt.Errorf("sub-agent: the model emitted the same malformed tool call (%s) %d times in a row — giving up", tc.Name, maxBadCallRepeats)
+				}
+				results = append(results, toolResult{Name: tc.Name, Output: out})
+				continue
+			}
+			badCalls.reset()
 			if canonicalTool(tc.Name) == "finish" {
 				report := strings.TrimSpace(argStr(tc.Args, "summary"))
 				if report == "" {

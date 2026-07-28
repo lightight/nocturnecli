@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -41,31 +42,142 @@ type parsedToolBlock struct {
 func parseResponse(text string) (narration string, calls []ToolCall) {
 	text = toolBlockAlt.ReplaceAllString(text, toolOpenTag+` name="$1">$2`+toolCloseTag+`>`)
 	matches := scanToolBlocks(text)
-	if len(matches) == 0 {
+
+	// A reply can end mid-tool-call (output limit or derailment) leaving an
+	// opening <tool> tag with no closing tag. Surface it as an error call so
+	// the agent loops feed it back and the model resends, instead of the call
+	// silently vanishing and the turn ending with nothing done.
+	inc, hasInc := findIncompleteToolCall(text, matches)
+
+	if len(matches) == 0 && !hasInc {
 		narration = resultBlock.ReplaceAllString(text, "")
 		return strings.TrimSpace(narration), nil
 	}
 
+	// Prose is the reply minus every tool span: complete blocks, plus the
+	// truncated fragment (which runs to the next complete block or the end).
+	type span struct{ start, end int }
+	spans := make([]span, 0, len(matches)+1)
+	for _, mb := range matches {
+		spans = append(spans, span{mb.start, mb.end})
+	}
+	if hasInc {
+		incEnd := len(text)
+		for _, mb := range matches {
+			if mb.start > inc.start {
+				incEnd = mb.start
+				break
+			}
+		}
+		spans = append(spans, span{inc.start, incEnd})
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+
 	var prose strings.Builder
 	last := 0
-	for _, mb := range matches {
-		prose.WriteString(text[last:mb.start])
-		last = mb.end
+	for _, s := range spans {
+		if s.start < last {
+			continue
+		}
+		prose.WriteString(text[last:s.start])
+		last = s.end
+	}
+	prose.WriteString(text[last:])
 
+	for _, mb := range matches {
 		raw := strings.TrimSpace(mb.raw)
 		raw = stripFences(raw)
 
 		tc := ToolCall{Name: mb.name, Args: map[string]any{}}
-		if raw != "" && !parseArgs(raw, &tc.Args) {
-			tc.Args = map[string]any{"__parse_error": true, "__raw": oneLine(raw, 300)}
+		if raw != "" {
+			if detail, ok := parseArgs(raw, &tc.Args); !ok {
+				tc.Args = map[string]any{"__parse_error": true, "__raw": oneLine(raw, 300)}
+				if detail != "" {
+					tc.Args["__err"] = detail
+				}
+			}
 		}
 		calls = append(calls, tc)
 	}
-	prose.WriteString(text[last:])
+
+	if hasInc {
+		name := inc.name
+		if name == "" {
+			name = "unknown"
+		}
+		calls = append(calls, ToolCall{Name: name, Args: map[string]any{
+			"__truncated": true, "__raw": oneLine(strings.TrimSpace(inc.raw), 300)}})
+	}
 
 	narration = resultBlock.ReplaceAllString(prose.String(), "")
 	narration = strings.TrimSpace(narration)
 	return narration, dedupeCalls(calls)
+}
+
+// incompleteToolCall is a <tool> opening that never reached its closing tag.
+type incompleteToolCall struct {
+	start int
+	name  string
+	raw   string // the fragment after the opening tag
+}
+
+// findIncompleteToolCall locates the first <tool ...> opening in text that is
+// not part of a complete scanned block or a hallucinated <tool_result> block.
+func findIncompleteToolCall(text string, matches []parsedToolBlock) (incompleteToolCall, bool) {
+	lower := strings.ToLower(text)
+	openResult := toolOpenTag + "_result"
+	resultSpans := resultBlock.FindAllStringIndex(text, -1)
+	inSpans := func(i int) (int, bool) {
+		for _, sp := range resultSpans {
+			if i >= sp[0] && i < sp[1] {
+				return sp[1], true
+			}
+		}
+		return 0, false
+	}
+	for pos := 0; pos < len(text); {
+		i := strings.Index(lower[pos:], toolOpenTag)
+		if i < 0 {
+			break
+		}
+		i += pos
+		if strings.HasPrefix(lower[i:], openResult) {
+			if end, ok := inSpans(i); ok {
+				pos = end
+			} else {
+				pos = i + len(toolOpenTag)
+			}
+			continue
+		}
+		inside := false
+		for _, mb := range matches {
+			if i >= mb.start && i < mb.end {
+				inside = true
+				pos = mb.end
+				break
+			}
+		}
+		if inside {
+			continue
+		}
+		if end, ok := inSpans(i); ok {
+			pos = end
+			continue
+		}
+		// Not a complete block: the call was cut off. Grab whatever name and
+		// body fragment exist after the tag.
+		name := ""
+		gtRel := strings.IndexByte(text[i:], '>')
+		if gtRel >= 0 {
+			name, _ = parseToolStartName(text[i : i+gtRel+1])
+			return incompleteToolCall{start: i, name: name, raw: text[i+gtRel+1:]}, true
+		}
+		if m := toolStartName.FindStringSubmatch(text[i:]); len(m) == 2 {
+			name = m[1]
+		}
+		return incompleteToolCall{start: i, name: name}, true
+	}
+	return incompleteToolCall{}, false
 }
 
 func scanToolBlocks(text string) []parsedToolBlock {
@@ -139,26 +251,82 @@ func findCloseToolTag(text string, pos int) (int, int) {
 }
 
 // parseArgs decodes a tool-call argument object, tolerating the malformed JSON
-// weaker models emit: extra trailing braces, code fences, trailing junk, and
-// raw newlines/tabs inside string values (which strict JSON forbids). It tries
-// the raw text and a control-char-repaired version, each both strictly and via
-// first-balanced-object extraction.
-func parseArgs(raw string, out *map[string]any) bool {
-	for _, cand := range []string{raw, repairControlChars(raw)} {
+// weaker models emit: extra trailing braces, code fences, trailing junk, raw
+// newlines/tabs inside string values, and invalid backslash escapes (e.g. a
+// regex written as \. instead of \\.), all of which strict JSON forbids. It
+// tries the raw text plus repaired variants, each both strictly and via
+// first-balanced-object extraction. On failure it returns a short description
+// of the JSON error so the retry feedback can say exactly what was wrong.
+func parseArgs(raw string, out *map[string]any) (string, bool) {
+	var firstErr string
+	for _, cand := range []string{raw, repairControlChars(raw), repairInvalidEscapes(raw), repairInvalidEscapes(repairControlChars(raw))} {
 		m := map[string]any{}
-		if json.Unmarshal([]byte(cand), &m) == nil {
+		if err := json.Unmarshal([]byte(cand), &m); err == nil {
 			*out = m
-			return true
+			return "", true
+		} else if firstErr == "" {
+			firstErr = err.Error()
 		}
 		if obj, ok := extractJSONObject(cand); ok {
 			m2 := map[string]any{}
-			if json.Unmarshal([]byte(obj), &m2) == nil {
+			if err := json.Unmarshal([]byte(obj), &m2); err == nil {
 				*out = m2
-				return true
+				return "", true
+			} else if firstErr == "" {
+				firstErr = err.Error()
 			}
 		}
 	}
-	return false
+	return firstErr, false
+}
+
+// repairInvalidEscapes doubles backslashes that start an invalid JSON escape
+// inside a string literal. Models writing regexes often emit \. \s \( etc.,
+// which JSON rejects; doubling the backslash preserves the intended text.
+func repairInvalidEscapes(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !inStr {
+			if c == '"' {
+				inStr = true
+			}
+			b.WriteByte(c)
+			continue
+		}
+		if c == '\\' && i+1 < len(s) {
+			n := s[i+1]
+			valid := strings.IndexByte(`"\/bfnrt`, n) >= 0 || (n == 'u' && i+5 < len(s) && isHex4(s[i+2:i+6]))
+			if valid {
+				b.WriteByte(c)
+				b.WriteByte(n)
+				i++
+				continue
+			}
+			b.WriteString(`\\`)
+			continue
+		}
+		if c == '"' {
+			inStr = false
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+func isHex4(s string) bool {
+	if len(s) < 4 {
+		return false
+	}
+	for i := 0; i < 4; i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // repairControlChars escapes literal newlines/tabs/returns that appear inside
@@ -323,7 +491,7 @@ func systemPromptModeWithTools(workdir string, cowork, plan, goal, subagents boo
 const planTemplate = `# Plan mode
 Plan mode is ON. Your job now is to EXPLORE and PLAN, not to execute.
 
-- Use only the read-only tools: open, list_dir, search. Do NOT call write / edit_file /
+- Use only the read-only tools: open, list_dir, search, web_search. Do NOT call write / edit_file /
   delete / rename / run / import_github / task or any screen tool — the CLI will refuse them.
 - Investigate the codebase until you understand what needs to change, then reply with a
   concrete step-by-step plan: real files, functions, and commands, in the order to do them.
@@ -392,9 +560,6 @@ func loadSystemTemplate() string {
 		if b, err := os.ReadFile(path); err == nil {
 			return strings.TrimRight(string(b), "\n")
 		}
-	}
-	if b, err := os.ReadFile("internal/app/system_prompt.txt"); err == nil {
-		return strings.TrimRight(string(b), "\n")
 	}
 	return strings.TrimRight(embeddedSystemTemplate, "\n")
 }

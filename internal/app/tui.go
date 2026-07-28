@@ -3,8 +3,10 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -38,9 +40,10 @@ const (
 	modeTrust
 )
 
-// autoCompactThreshold is the context size (tokens) at which the conversation
-// is summarised automatically, to stay clear of the ~1M ceiling.
-const autoCompactThreshold = 900_000
+// autoCompactFraction is the share of the selected model's context window at
+// which the conversation is summarised automatically, leaving headroom for the
+// next user turn, system prompt, tool results, and model output.
+const autoCompactFraction = 0.90
 
 // maxInputRows caps how tall the input box can grow as text wraps.
 const maxInputRows = 10
@@ -63,6 +66,7 @@ var slashCommands = []slashItem{
 	{"/permissions", "how tool actions are approved (ask · auto · bypass)"},
 	{"/key", "save your API key (remembered everywhere)"},
 	{"/tools", "list installed custom tools"},
+	{"/report", "anonymous e2e-encrypted debug report — view · send · never"},
 	{"/tool-import", "install custom tools from a provider JSON path/URL"},
 	{"/tool-add", "install one custom shell tool"},
 	{"/tool-remove", "remove an installed custom tool"},
@@ -114,6 +118,12 @@ type tuiModel struct {
 	results     []toolResult
 	confirm     ToolCall
 	guardReason string // why the guard flagged m.confirm (empty for a plain ask)
+	emptyNudges int    // consecutive empty-reply nudges sent this turn
+	badCalls    badCallBreaker
+
+	// anonymous problem reports (opt-in, e2e-encrypted)
+	health      *healthTracker
+	reportAsked bool // hint already shown this session
 
 	// /permissions picker
 	permSel int
@@ -190,6 +200,36 @@ type tuiModel struct {
 // currentVision reports whether the selected model can see attached images.
 func (m *tuiModel) currentVision() bool {
 	return m.client.supportsVision(m.cfg.Model)
+}
+
+func (m *tuiModel) currentModelInfo() (ModelInfo, bool) {
+	id := normalizeModelID(m.cfg.Model)
+	for _, md := range m.models {
+		if normalizeModelID(md.ID) == id {
+			return md, true
+		}
+	}
+	return knownModelInfo(id)
+}
+
+func (m *tuiModel) contextLimit() int {
+	if md, ok := m.currentModelInfo(); ok && md.MaxTokens > 0 {
+		return md.MaxTokens
+	}
+	return fallbackContextLimit(m.cfg.Model)
+}
+
+func (m *tuiModel) autoCompactThreshold() int {
+	limit := m.contextLimit()
+	if limit <= 0 {
+		return 0
+	}
+	return int(float64(limit) * autoCompactFraction)
+}
+
+func (m *tuiModel) shouldAutoCompact() bool {
+	threshold := m.autoCompactThreshold()
+	return threshold > 0 && m.ctxTokens >= threshold && !m.compacting
 }
 
 // --- messages --------------------------------------------------------------
@@ -324,6 +364,7 @@ func newModel(cfg *Config, version string) *tuiModel {
 		cfg: cfg, client: NewClient(cfg), work: work, ver: version,
 		ta: ta, sp: sp, vp: viewport.New(0, 0), mode: modeInput, follow: true,
 		sessionID: newSessionID(), sessionStart: time.Now(),
+		health:          newHealthTracker(),
 		remoteDraftSent: "\xff",
 	}
 	m.rebuildRenderer()
@@ -478,6 +519,14 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case apiRespMsg:
 		return m.handleAPIResp(msg)
+
+	case reportDoneMsg:
+		if msg.err != nil {
+			m.push(stErr.Render("  ✗ couldn't send report: " + msg.err.Error()))
+		} else {
+			m.push(stOK.Render("  ✓ report sent — sealed so only the team can open it. thank you!"))
+		}
+		return m, nil
 
 	case streamDeltaMsg:
 		return m.handleStreamDelta(msg)
@@ -1120,7 +1169,7 @@ func (m *tuiModel) settleIdleCmd() tea.Cmd {
 	if len(m.backgroundDone) > 0 {
 		return m.startBackgroundCommandReply()
 	}
-	if m.ctxTokens >= autoCompactThreshold && !m.compacting {
+	if m.shouldAutoCompact() {
 		return m.compactCmd(true)
 	}
 	return nil
@@ -1316,6 +1365,56 @@ func (m *tuiModel) replyError(err error) {
 	}
 	m.push(stErr.Render("  ✗ " + err.Error()))
 	m.toRemote("status", "✗ "+err.Error())
+	if errors.Is(err, ErrStreamClosedEarly) {
+		m.health.recordStreamError()
+	} else {
+		m.health.recordAPIError()
+	}
+	m.maybeReportHint()
+}
+
+// maybeReportHint nudges the user toward /report once per session when the
+// session has hit enough reliability hiccups. Nothing is ever sent without an
+// explicit /report send.
+func (m *tuiModel) maybeReportHint() {
+	if m.reportAsked || m.cfg.ReportOptOut || m.health.issues() < reportHintThreshold {
+		return
+	}
+	m.reportAsked = true
+	m.push(stHint.Render(fmt.Sprintf("  ◗ nocturne hit %d hiccups this session — /report view shows an anonymous, end-to-end-encrypted debug report; /report send shares it with the team (nothing is sent automatically)", m.health.issues())))
+}
+
+type reportDoneMsg struct{ err error }
+
+// runReportSlash handles /report [view|send|never]. The payload is shown in
+// full before any send so the user can verify it carries nothing identifying.
+func (m *tuiModel) runReportSlash(arg string) (tea.Model, tea.Cmd) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "never", "off", "optout":
+		m.cfg.ReportOptOut = true
+		if err := m.cfg.Save(); err != nil {
+			m.push(stErr.Render("  couldn't save preference: " + err.Error()))
+			break
+		}
+		m.push(stOK.Render("  ✓ got it — no more report hints (and reports are never sent automatically anyway)"))
+	case "send":
+		payload := buildReport(m.health, m.cfg, m.ver, len(m.messages), m.sessionStart)
+		if payload.Counts["rounds"] == 0 && m.health.issues() == 0 {
+			m.push(stHint.Render("  no hiccups recorded this session — sending anyway, it helps calibrate the baseline"))
+		}
+		m.push(stHint.Render("  sending anonymous report " + payload.ID + "…"))
+		cfg := m.cfg
+		return m, func() tea.Msg { return reportDoneMsg{err: sendReport(cfg, payload)} }
+	case "", "view":
+		payload := buildReport(m.health, m.cfg, m.ver, len(m.messages), m.sessionStart)
+		pretty, _ := json.MarshalIndent(payload, "", "  ")
+		m.push(stDim.Render("  this is the ENTIRE report — no prompts, paths, commands, file contents, or account data:"))
+		m.push("```json\n" + string(pretty) + "\n```")
+		m.push(stHint.Render("  /report send to share it (e2e-encrypted to the team's key) · /report never to hide these hints"))
+	default:
+		m.push(stErr.Render("  usage: /report [view|send|never]"))
+	}
+	return m, nil
 }
 
 func (m *tuiModel) finishReply(text string, usage Usage, quota Quota) (tea.Model, tea.Cmd) {
@@ -1340,14 +1439,24 @@ func (m *tuiModel) finishReply(text string, usage Usage, quota Quota) (tea.Model
 	narration, calls := parseResponse(text)
 
 	if len(calls) == 0 {
+		if emptyReply(narration, calls) && m.emptyNudges < maxEmptyNudges {
+			m.emptyNudges++
+			m.health.recordEmptyReply()
+			m.push(stHint.Render("  ↻ empty reply — asking the model to continue"))
+			m.messages = append(m.messages, ChatMessage{Role: "user", Content: emptyReplyNudge})
+			return m, m.startReply()
+		}
+		m.emptyNudges = 0
 		m.mode = modeInput
 		if out := m.renderAssistant(narration); out != "" {
 			m.push(out)
 		}
 		m.toRemote("assistant", narration)
 		m.persistSession()
+		m.maybeReportHint()
 		return m, m.settleIdleCmd()
 	}
+	m.emptyNudges = 0
 
 	if narration != "" {
 		m.push(m.renderAssistant(narration))
@@ -1378,6 +1487,27 @@ func (m *tuiModel) advanceTools() tea.Cmd {
 	}
 
 	tc := m.pending[0]
+
+	if out, bad := diagnoseBadToolCall(tc, m.cfg.Tools); bad {
+		m.pushToolCall(tc)
+		m.health.recordBadCall(tc, out)
+		if m.badCalls.add(tc) {
+			m.health.recordBreakerTrip()
+			m.push(stErr.Render(fmt.Sprintf("  ✗ model repeated the same bad tool call (%s) %d times — stopping here so it doesn't burn API calls. Try rephrasing, or a different model.", tc.Name, maxBadCallRepeats)))
+			m.pending = nil
+			m.results = nil
+			m.mode = modeInput
+			m.persistSession()
+			m.maybeReportHint()
+			return m.settleIdleCmd()
+		}
+		m.push(stErr.Render("  ✗ bad tool call — automatically asking model to retry"))
+		m.toRemote("tool", "● "+tc.summarize())
+		m.pending = m.pending[1:]
+		m.results = append(m.results, toolResult{Name: tc.Name, Output: out})
+		return m.advanceTools()
+	}
+	m.badCalls.reset()
 
 	// Control tools steer the loop instead of producing a fed-back result.
 	switch canonicalTool(tc.Name) {
@@ -2371,7 +2501,7 @@ func (m *tuiModel) statusLine() string {
 		return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("streaming… (%s · esc to interrupt)", m.elapsed()))
 	default:
 		scroll := "wheel/pgup/pgdn scroll · drag selects"
-		line := "  enter ↵ send · alt+↵ newline · ctrl+v paste image · " + scroll + " · / commands"
+		line := "  " + m.contextUsageString() + " · enter ↵ send · alt+↵ newline · ctrl+v paste image · " + scroll + " · / commands"
 		if m.cowork {
 			line = stAccent.Render("  cowork") + stHint.Render(" · ") + strings.TrimLeft(line, " ")
 		}
@@ -2749,6 +2879,8 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 		}
 	case "/tools":
 		m.push(m.customToolsList())
+	case "/report":
+		return m.runReportSlash(arg)
 	case "/install":
 		if arg == "" {
 			m.push(stErr.Render("  usage: /install <skill-url-or-path>"))
@@ -3067,12 +3199,15 @@ func ensureModels(models []ModelInfo, ids ...string) []ModelInfo {
 	return append(extra, models...)
 }
 
-// modelMeta renders the pricing/tags suffix for a model, omitting pricing when
-// it's unknown (the models we inject manually have none).
+// modelMeta renders the pricing/context/tags suffix for a model, omitting
+// pricing when it's unknown (some models we inject manually have none).
 func modelMeta(md ModelInfo) string {
 	var parts []string
 	if md.InPrice > 0 || md.OutPrice > 0 {
 		parts = append(parts, fmt.Sprintf("$%g/$%g", md.InPrice, md.OutPrice))
+	}
+	if md.MaxTokens > 0 {
+		parts = append(parts, "context "+formatTokenLimit(md.MaxTokens))
 	}
 	var tags []string
 	if md.Reasoning {
@@ -3088,6 +3223,38 @@ func modelMeta(md ModelInfo) string {
 		parts = append(parts, "· "+strings.Join(tags, " · "))
 	}
 	return strings.Join(parts, "  ")
+}
+
+func fallbackContextLimit(model string) int {
+	if md, ok := knownModelInfo(model); ok && md.MaxTokens > 0 {
+		return md.MaxTokens
+	}
+	return 256_000
+}
+
+func formatTokenLimit(n int) string {
+	if n >= 1_000_000 && n%1_000_000 == 0 {
+		return fmt.Sprintf("%dmil", n/1_000_000)
+	}
+	if n >= 1_000_000 {
+		return trimZero(fmt.Sprintf("%.1f", float64(n)/1_000_000)) + "mil"
+	}
+	if n >= 1000 && n%1000 == 0 {
+		return fmt.Sprintf("%dk", n/1000)
+	}
+	return commas(n)
+}
+
+func (m *tuiModel) contextUsageString() string {
+	limit := m.contextLimit()
+	if limit <= 0 {
+		return fmt.Sprintf("context: ?%% %s/?", commas(m.ctxTokens))
+	}
+	pct := 0
+	if m.ctxTokens > 0 {
+		pct = int(math.Round(float64(m.ctxTokens) * 100 / float64(limit)))
+	}
+	return fmt.Sprintf("context: %d%% %s/%s", pct, abbrev(int64(m.ctxTokens)), formatTokenLimit(limit))
 }
 
 func levelLabel(l string) string {

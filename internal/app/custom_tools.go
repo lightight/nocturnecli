@@ -33,7 +33,7 @@ var customToolNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z_]*$`)
 
 var builtinToolNames = map[string]bool{
 	"open": true, "read_file": true, "write": true, "create": true, "write_file": true,
-	"edit_file": true, "delete": true, "rename": true, "list_dir": true, "search": true,
+	"edit_file": true, "delete": true, "rename": true, "list_dir": true, "search": true, "web_search": true,
 	"run": true, "run_command": true, "import_github": true, "github": true, "import": true, "clone": true,
 	"install_skill": true, "install": true, "skill": true, "skill_install": true, "install_tool": true,
 	"ask": true, "cowork": true, "finish": true, "task": true, "agent": true, "subagent": true, "spawn": true,

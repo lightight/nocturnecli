@@ -30,6 +30,26 @@ dist/nocturne_windows_arm64.exe
 try to download from `/bin/` on the same host. If a binary is missing, the
 installers fall back to GitHub Releases and then `go install`.
 
+## Anonymous problem reports
+
+```sh
+./nocturne serve --addr :8080 --bin ./dist --reports ./reports
+```
+
+`--reports <dir>` (or `NOCTURNE_REPORTS_DIR`) enables `POST /api/report`, which
+stores sealed, anonymous debug reports that users explicitly send with
+`/report send`. Reports are end-to-end-encrypted to the team key baked into
+the CLI — the server only stores blobs it cannot read. Fetch them off the box
+and open them locally:
+
+```sh
+NOCTURNE_REPORT_PRIVKEY=… nocturne report-decrypt reports/<file>.json
+```
+
+The private key (`nocturne report-keygen`) must NEVER live on the server.
+Clients post to `{BaseURL}/api/report` (default `https://nocturne.lol`), so
+route that path to this service in the reverse proxy.
+
 ## Reverse Proxy
 
 Put the server behind HTTPS. The browser remote client uses Web Crypto, which

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -23,7 +25,16 @@ type Session struct {
 
 func sessionsDir() string { return filepath.Join(configDir(), "sessions") }
 
-func newSessionID() string { return time.Now().Format("20060102-150405") }
+// newSessionID is a timestamp plus a short random suffix, so two sessions
+// started within the same second (e.g. a quick -p run and the TUI) don't
+// overwrite each other's file.
+func newSessionID() string {
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return time.Now().Format("20060102-150405.000000000")
+	}
+	return time.Now().Format("20060102-150405") + "-" + hex.EncodeToString(b[:])
+}
 
 // saveSession writes the session to disk (one JSON file per session). Image
 // bytes are dropped to keep files small — they were already processed.

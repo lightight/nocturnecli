@@ -1,9 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -48,6 +51,50 @@ Configuration:
 // Run is the CLI entry point.
 func Run(args []string) error {
 	// Subcommands.
+	if len(args) > 0 && args[0] == "report-keygen" {
+		// Team tool: mint the X25519 keypair for anonymous reports. The public
+		// half is baked into builds (reportPublicKeyB64), the private half
+		// stays with whoever decrypts reports.
+		pub, priv, err := generateReportKey()
+		if err != nil {
+			return err
+		}
+		fmt.Println("public (bake into reportPublicKeyB64 or NOCTURNE_REPORT_PUBKEY):", pub)
+		fmt.Println("private (keep secret, used by report-decrypt):", priv)
+		return nil
+	}
+	if len(args) > 0 && args[0] == "report-decrypt" {
+		// Team tool: open a sealed report envelope (file path or "-" for
+		// stdin) with the private key from NOCTURNE_REPORT_PRIVKEY.
+		priv := strings.TrimSpace(os.Getenv("NOCTURNE_REPORT_PRIVKEY"))
+		if priv == "" {
+			return fmt.Errorf("set NOCTURNE_REPORT_PRIVKEY to the private key from report-keygen")
+		}
+		if len(args) < 2 {
+			return fmt.Errorf("usage: nocturne report-decrypt <envelope.json|->")
+		}
+		var data []byte
+		var err error
+		if args[1] == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(args[1])
+		}
+		if err != nil {
+			return err
+		}
+		plain, err := decryptReport(data, priv)
+		if err != nil {
+			return err
+		}
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, plain, "", "  ") == nil {
+			fmt.Println(pretty.String())
+		} else {
+			fmt.Println(string(plain))
+		}
+		return nil
+	}
 	if len(args) > 0 && args[0] == "models" {
 		cfg := LoadConfig()
 		if err := checkStartupKey(cfg); err != nil {
@@ -60,6 +107,9 @@ func Run(args []string) error {
 		fmt.Printf("default: %s\n\n", displayModel(def))
 		for _, md := range models {
 			var tags []string
+			if md.MaxTokens > 0 {
+				tags = append(tags, "context "+formatTokenLimit(md.MaxTokens))
+			}
 			if md.Reasoning {
 				tags = append(tags, "reasoning")
 			}
@@ -150,23 +200,61 @@ func checkStartupKey(cfg *Config) error {
 // auto-accepting tool calls, streaming activity to stderr and the final answer
 // to stdout. Suited for scripting and piping.
 func runHeadless(cfg *Config, prompt string, cowork bool) error {
+	health := newHealthTracker()
+	start := time.Now()
+	err := runHeadlessLoop(cfg, prompt, cowork, health)
+	headlessReportNote(cfg, health, start)
+	return err
+}
+
+// headlessReportNote offers (never forces) an anonymous report after a bumpy
+// run. NOCTURNE_SEND_REPORT=1 sends it; otherwise a one-line hint explains how.
+func headlessReportNote(cfg *Config, health *healthTracker, start time.Time) {
+	if health.issues() == 0 {
+		return
+	}
+	if os.Getenv("NOCTURNE_SEND_REPORT") == "1" {
+		payload := buildReport(health, cfg, Version, 0, start)
+		if err := sendReport(cfg, payload); err != nil {
+			fmt.Fprintln(os.Stderr, stErr.Render("  ✗ couldn't send report: "+err.Error()))
+			return
+		}
+		fmt.Fprintln(os.Stderr, stOK.Render("  ✓ anonymous report "+payload.ID+" sent — sealed so only the team can open it"))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  ◗ nocturne hit %d hiccups this run — re-run with NOCTURNE_SEND_REPORT=1 to send an anonymous, end-to-end-encrypted debug report (nothing is sent automatically)\n", health.issues())
+}
+
+func runHeadlessLoop(cfg *Config, prompt string, cowork bool, health *healthTracker) error {
 	work, _ := os.Getwd()
 	client := NewClient(cfg)
 	msgs := []ChatMessage{{Role: "user", Content: prompt}}
 
 	const maxRounds = 30
+	emptyNudges := 0
+	var badCalls badCallBreaker
 	for round := 0; round < maxRounds; round++ {
+		health.recordRound()
 		res, err := client.Chat(context.Background(), systemPromptModeWithTools(work, cowork, false, false, cfg.Level == "extended", cfg.Tools), msgs)
 		if err != nil {
+			health.recordAPIError()
 			return err
 		}
 		msgs = append(msgs, ChatMessage{Role: "assistant", Content: res.Text})
 
 		narration, calls := parseResponse(res.Text)
 		if len(calls) == 0 {
+			if emptyReply(narration, calls) && emptyNudges < maxEmptyNudges {
+				emptyNudges++
+				health.recordEmptyReply()
+				fmt.Fprintln(os.Stderr, stDim.Render("  ↻ empty reply — asking the model to continue"))
+				msgs = append(msgs, ChatMessage{Role: "user", Content: emptyReplyNudge})
+				continue
+			}
 			fmt.Println(narration)
 			return nil
 		}
+		emptyNudges = 0
 		if narration != "" {
 			fmt.Fprintln(os.Stderr, stDim.Render(narration))
 		}
@@ -174,6 +262,18 @@ func runHeadless(cfg *Config, prompt string, cowork bool) error {
 		var results []toolResult
 		var images []Image
 		for _, tc := range calls {
+			if out, bad := diagnoseBadToolCall(tc, cfg.Tools); bad {
+				fmt.Fprintln(os.Stderr, stAccent.Render("● ")+tc.summarize())
+				fmt.Fprintln(os.Stderr, stErr.Render("  ✗ bad tool call — automatically asking model to retry"))
+				health.recordBadCall(tc, out)
+				if badCalls.add(tc) {
+					health.recordBreakerTrip()
+					return fmt.Errorf("the model emitted the same malformed tool call (%s) %d times in a row — stopping instead of burning more API calls; try rephrasing the task or a different model", tc.Name, maxBadCallRepeats)
+				}
+				results = append(results, toolResult{Name: tc.Name, Output: out})
+				continue
+			}
+			badCalls.reset()
 			if canonicalTool(tc.Name) == "finish" {
 				summary := strings.TrimSpace(argStr(tc.Args, "summary"))
 				if summary == "" {

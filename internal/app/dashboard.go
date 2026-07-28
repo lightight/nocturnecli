@@ -229,6 +229,7 @@ func (m *tuiModel) renderStatus() string {
 	b.WriteString(kv("Session ID", stDim.Render(m.sessionID)) + "\n")
 	b.WriteString(kv("cwd", prettyPath(m.work)) + "\n")
 	b.WriteString(kv("Model", stAccent.Render(displayModel(m.cfg.Model))) + "\n")
+	b.WriteString(kv("Context", stAccent.Render(m.contextUsageString())) + "\n")
 	b.WriteString(kv("Thinking", levelLabel(m.cfg.Level)) + "\n")
 	b.WriteString(kv("Approvals", permLabel(m.cfg.Perm)) + "\n")
 	b.WriteString(kv("Streaming", boolLabel(m.cfg.Stream, "on", "off")) + "\n")
@@ -243,6 +244,7 @@ func (m *tuiModel) renderUsage() string {
 	var b strings.Builder
 	b.WriteString(stTitle.Render("  Session") + "\n")
 	b.WriteString(kv("Model", stAccent.Render(displayModel(m.cfg.Model))) + "\n")
+	b.WriteString(kv("Context", stAccent.Render(m.contextUsageString())) + "\n")
 	b.WriteString(kv("Duration", stAccent.Render(humanDur(time.Since(m.sessionStart)))) + "\n")
 	b.WriteString(kv("Messages", stAccent.Render(strconv.Itoa(countUserMsgs(m.messages)))) + "\n")
 	b.WriteString(kv("Tokens", stAccent.Render(commas(m.tokens))) + "\n")

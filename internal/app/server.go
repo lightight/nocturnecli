@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ type ServerAssets struct {
 	InstallSh  string
 	InstallPs1 string
 	BinDir     string // optional directory of prebuilt binaries to serve at /bin/
+	ReportsDir string // optional directory to store sealed anonymous reports in
 }
 
 // RunServer hosts the docs site + install scripts + the end-to-end-encrypted
@@ -38,7 +41,15 @@ func RunServer(args []string, assets ServerAssets) error {
 				assets.BinDir = args[i+1]
 				i++
 			}
+		case "-reports", "--reports":
+			if i+1 < len(args) {
+				assets.ReportsDir = args[i+1]
+				i++
+			}
 		}
+	}
+	if assets.ReportsDir == "" {
+		assets.ReportsDir = os.Getenv("NOCTURNE_REPORTS_DIR")
 	}
 	srv := newRelayServer(assets)
 	fmt.Printf("Nocturne site + relay listening on %s\n", addr)
@@ -137,6 +148,7 @@ func (s *relayServer) handler() http.Handler {
 	mux.HandleFunc("GET /api/remote/{id}/to-browser", s.toBrowser)
 	mux.HandleFunc("POST /api/remote/{id}/from-cli", s.fromCLI)
 	mux.HandleFunc("POST /api/remote/{id}/from-browser", s.fromBrowser)
+	mux.HandleFunc("POST /api/report", s.report)
 	if s.assets.BinDir != "" {
 		mux.Handle("GET /bin/", http.StripPrefix("/bin/", http.FileServer(http.Dir(s.assets.BinDir))))
 	}
@@ -149,6 +161,42 @@ func baseURL(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+// maxReportBytes caps one sealed report. Payloads are small (aggregate counts
+// only); the cap keeps the unauthenticated endpoint from becoming a disk fill.
+const maxReportBytes = 256 << 10
+
+// report stores one sealed, anonymous debug report. Like the remote relay,
+// the server cannot read what it stores — reports are e2e-encrypted to the
+// team's key — it only keeps the blob for the team to fetch and open offline
+// with `nocturne report-decrypt`.
+func (s *relayServer) report(w http.ResponseWriter, r *http.Request) {
+	if s.assets.ReportsDir == "" {
+		http.Error(w, "report collection is not enabled on this server", http.StatusNotFound)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxReportBytes))
+	if err != nil {
+		http.Error(w, "report too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	var env reportEnvelope
+	if err := json.Unmarshal(body, &env); err != nil || env.Alg == "" || env.Box == "" {
+		http.Error(w, "not a sealed report envelope", http.StatusBadRequest)
+		return
+	}
+	if err := os.MkdirAll(s.assets.ReportsDir, 0o755); err != nil {
+		http.Error(w, "storage unavailable", http.StatusInternalServerError)
+		return
+	}
+	name := time.Now().UTC().Format("20060102-150405") + "-" + randomID() + ".json"
+	if err := os.WriteFile(filepath.Join(s.assets.ReportsDir, name), body, 0o644); err != nil {
+		http.Error(w, "could not store report", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	io.WriteString(w, `{"ok":true}`)
 }
 
 func (s *relayServer) index(w http.ResponseWriter, r *http.Request) {

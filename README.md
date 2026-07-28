@@ -169,8 +169,8 @@ JSON arguments.
   picker of saved chats from the current directory and restores one (messages, model, transcript).
 - **`/compact`** summarizes the conversation into a compact brief and continues from it, freeing
   up context. The summary is kept silently as context — it isn't dumped into the chat. Nocturne
-  also **compacts automatically** as the context approaches ~1M tokens. `/tokens` shows the live
-  context size.
+  also **compacts automatically** at 90% of the selected model's reported context window.
+  `/tokens` shows the live context size.
 - **Scroll** the transcript with **PgUp/PgDn** or the mouse wheel. Text selection, copy, and paste
   continue to work natively. The input box **wraps** long prompts onto new lines (it grows as you
   type) instead of scrolling text off.

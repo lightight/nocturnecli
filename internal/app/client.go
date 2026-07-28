@@ -79,21 +79,59 @@ func knownModelInfo(id string) (ModelInfo, bool) {
 		id = VisionModel
 	case "gpt-5.4-mini":
 		id = GuardModel
-	case "gemini-3.5-flash":
-		id = "navy:gemini-3.5-flash"
+	case "gpt-4o-mini-search-preview", "gemini-3.1-pro-preview", "gemini-3.5-flash",
+		"grok-4.3", "grok-4.1-fast-reasoning", "deepseek-v4-pro", "llama-4-scout",
+		"mistral-medium-latest", "kimi-k2.6", "nemotron-3-super", "mimo-v2.5-pro",
+		"c4ai-aya-expanse-32b", "gpt-4o", "kimi-k2.5", "qwen3.5-397b-a17b",
+		"hermes-4-405b", "mistral-medium-3.5":
+		id = "navy:" + id
 	}
-	switch id {
-	case DefaultModel:
-		return ModelInfo{ID: DefaultModel, Label: "GPT-5.5", Company: "OpenAI", Reasoning: true}, true
-	case VisionModel:
-		return ModelInfo{ID: VisionModel, Label: "Claude Haiku 4.5", Company: "Anthropic", Vision: true}, true
-	case GuardModel:
-		return ModelInfo{ID: GuardModel, Label: "GPT-5.4 Mini", Company: "OpenAI", Vision: true}, true
-	case "navy:gemini-3.5-flash":
-		return ModelInfo{ID: id, Label: "Gemini 3.5 Flash", Company: "Google", Vision: true}, true
-	default:
-		return ModelInfo{}, false
+
+	models := map[string]ModelInfo{
+		// The current public /api/ai/config no longer lists navy:gpt-5.5, but keep
+		// an entry so older configs that still point at it have sane UI.
+		DefaultModel: {ID: DefaultModel, Label: "GPT-5.5", Company: "OpenAI", Reasoning: true, MaxTokens: 500_000},
+
+		"llama-3.3-70b-versatile":                   {ID: "llama-3.3-70b-versatile", Label: "Llama 3.3 70B (Versatile)", Company: "Llama", Reasoning: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"openai/gpt-oss-120b":                       {ID: "openai/gpt-oss-120b", Label: "GPT-OSS 120B", Company: "ChatGPT", Reasoning: true, MaxTokens: 500_000, InPrice: 0.5, OutPrice: 2},
+		"qwen/qwen3-32b":                            {ID: "qwen/qwen3-32b", Label: "Qwen3 32B", Company: "Qwen", Reasoning: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"meta-llama/llama-4-scout-17b-16e-instruct": {ID: "meta-llama/llama-4-scout-17b-16e-instruct", Label: "Llama 4 Scout (Vision)", Company: "Llama", Vision: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+
+		GuardModel:                        {ID: GuardModel, Label: "ChatGPT 5.4 mini", Company: "ChatGPT", Reasoning: true, Vision: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		VisionModel:                       {ID: VisionModel, Label: "Claude Haiku 4.5", Company: "Claude", Reasoning: true, Vision: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"navy:gpt-4o-mini-search-preview": {ID: "navy:gpt-4o-mini-search-preview", Label: "GPT-4o mini Search (Preview)", Company: "ChatGPT", Reasoning: true, Vision: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"navy:gemini-3.1-pro-preview":     {ID: "navy:gemini-3.1-pro-preview", Label: "Gemini 3.1 Pro (Preview)", Company: "Gemini", Reasoning: true, Vision: true, MaxTokens: 500_000, InPrice: 3, OutPrice: 12},
+		"navy:gemini-3.5-flash":           {ID: "navy:gemini-3.5-flash", Label: "Gemini 3.5 Flash", Company: "Gemini", Vision: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"navy:grok-4.3":                   {ID: "navy:grok-4.3", Label: "Grok 4.3", Company: "Grok", Reasoning: true, Vision: true, MaxTokens: 500_000, InPrice: 3, OutPrice: 12},
+		"navy:grok-4.1-fast-reasoning":    {ID: "navy:grok-4.1-fast-reasoning", Label: "Grok 4.1 Fast (Reasoning)", Company: "Grok", Reasoning: true, MaxTokens: 256_000, InPrice: 1, OutPrice: 4},
+		"navy:deepseek-v4-pro":            {ID: "navy:deepseek-v4-pro", Label: "DeepSeek V4 Pro", Company: "DeepSeek", Reasoning: true, MaxTokens: 500_000, InPrice: 3, OutPrice: 12},
+		"navy:llama-4-scout":              {ID: "navy:llama-4-scout", Label: "Llama 4 Scout", Company: "Llama", Reasoning: true, Vision: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"navy:mistral-medium-latest":      {ID: "navy:mistral-medium-latest", Label: "Mistral Medium", Company: "Mistral", Reasoning: true, MaxTokens: 256_000, InPrice: 1, OutPrice: 4},
+		"navy:kimi-k2.6":                  {ID: "navy:kimi-k2.6", Label: "Kimi K2.6", Company: "Kimi", Reasoning: true, MaxTokens: 256_000, InPrice: 1, OutPrice: 4},
+		"navy:nemotron-3-super":           {ID: "navy:nemotron-3-super", Label: "Nemotron 3 Super", Company: "Nemotron", Reasoning: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"navy:mimo-v2.5-pro":              {ID: "navy:mimo-v2.5-pro", Label: "MiMo V2.5 Pro", Company: "MiMo", Reasoning: true, MaxTokens: 500_000, InPrice: 3, OutPrice: 12},
+		"navy:c4ai-aya-expanse-32b":       {ID: "navy:c4ai-aya-expanse-32b", Label: "Aya Expanse 32B", Company: "Cohere", Reasoning: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
+		"navy:gpt-4o":                     {ID: "navy:gpt-4o", Label: "GPT-4o", Company: "ChatGPT", Reasoning: true, Vision: true, MaxTokens: 256_000, InPrice: 1, OutPrice: 4},
+		"navy:kimi-k2.5":                  {ID: "navy:kimi-k2.5", Label: "Kimi K2.5", Company: "Kimi", Reasoning: true, MaxTokens: 256_000, InPrice: 1, OutPrice: 4},
+		"navy:qwen3.5-397b-a17b":          {ID: "navy:qwen3.5-397b-a17b", Label: "Qwen3.5 397B A17B", Company: "Qwen", Reasoning: true, MaxTokens: 500_000, InPrice: 1, OutPrice: 4},
+		"navy:hermes-4-405b":              {ID: "navy:hermes-4-405b", Label: "Hermes 4 405B", Company: "Hermes", Reasoning: true, MaxTokens: 500_000, InPrice: 1, OutPrice: 4},
+		"navy:mistral-medium-3.5":         {ID: "navy:mistral-medium-3.5", Label: "Mistral Medium 3.5", Company: "Mistral", Reasoning: true, MaxTokens: 256_000, InPrice: 1, OutPrice: 4},
 	}
+	md, ok := models[id]
+	return md, ok
+}
+
+func advertisedContextLimit(md ModelInfo) int {
+	if md.MaxTokens >= 256_000 {
+		return md.MaxTokens
+	}
+	id := strings.ToLower(normalizeModelID(md.ID))
+	label := strings.ToLower(md.Label)
+	name := id + " " + label
+	if md.Premium || md.InPrice >= 3 || strings.Contains(name, "pro") || strings.Contains(name, "grok-4.3") || strings.Contains(name, "gpt-5.5") || strings.Contains(name, "120b") || strings.Contains(name, "397b") || strings.Contains(name, "405b") {
+		return 500_000
+	}
+	return 256_000
 }
 
 // Client talks to the Nocturne completion endpoint.
@@ -699,11 +737,13 @@ func (c *Client) FetchModels(ctx context.Context) ([]ModelInfo, string, error) {
 
 	out := make([]ModelInfo, 0, len(cfg.Models))
 	for _, m := range cfg.Models {
-		out = append(out, ModelInfo{
+		md := ModelInfo{
 			ID: m.ID, Label: m.Label, Company: m.Company,
 			Reasoning: m.Reasoning, Vision: m.Vision, Premium: m.Premium,
 			MaxTokens: m.MaxTokens, InPrice: m.Pricing.In, OutPrice: m.Pricing.Out,
-		})
+		}
+		md.MaxTokens = advertisedContextLimit(md)
+		out = append(out, md)
 	}
 	return out, cfg.DefaultModel, nil
 }

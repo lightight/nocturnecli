@@ -3,6 +3,10 @@ package app
 import (
 	"context"
 	"fmt"
+	"html"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,6 +95,183 @@ func needsApproval(name string) bool {
 	return false
 }
 
+// diagnoseBadToolCall catches malformed tool calls before approval/execution and
+// turns them into a tool result. Feeding that result back into the agent loop
+// makes the model immediately retry the call, with a concrete explanation of
+// what was wrong, while guaranteeing nothing was run for the bad call.
+// diagnoseMalformedCall handles calls that never produced usable arguments:
+// cut-off (truncated) blocks and invalid JSON. Shared by diagnoseBadToolCall
+// and the plain-execute fallback so every path words the failure the same way.
+func diagnoseMalformedCall(tc ToolCall) (string, bool) {
+	if _, bad := tc.Args["__truncated"]; bad {
+		raw, _ := tc.Args["__raw"].(string)
+		fix := "Re-send the same call complete, ending with its closing tag. If you were writing a large file or long content, " +
+			"split it: write the first part, then append the rest with one or more edit_file calls, so the reply is not cut off again."
+		if raw != "" {
+			fix += " The fragment you sent began: " + raw
+		}
+		return retryToolCallMessage(tc.Name, "the tool call was cut off before its closing tag — the reply ended mid-call, usually because it was too long", fix), true
+	}
+	if _, bad := tc.Args["__parse_error"]; bad {
+		raw, _ := tc.Args["__raw"].(string)
+		problem := fmt.Sprintf("the arguments for %q were not valid JSON", tc.Name)
+		if detail, _ := tc.Args["__err"].(string); detail != "" {
+			problem += " (JSON error: " + detail + ")"
+		}
+		return retryToolCallMessage(tc.Name, problem,
+			"Re-send the same tool call with exactly one valid JSON object between the tags: no markdown fences, extra braces, comments, or trailing text. Bad arguments seen: "+raw), true
+	}
+	return "", false
+}
+
+func diagnoseBadToolCall(tc ToolCall, tools []CustomTool) (string, bool) {
+	if out, bad := diagnoseMalformedCall(tc); bad {
+		return out, true
+	}
+
+	if _, ok := findCustomTool(tools, tc.Name); ok {
+		return "", false
+	}
+	canon := canonicalTool(tc.Name)
+	if !builtinToolNames[tc.Name] && !builtinToolNames[canon] {
+		return retryToolCallMessage(tc.Name, fmt.Sprintf("%q is not a known tool", tc.Name),
+			"Use one of the advertised tool names exactly. Known tools: "+knownToolNames(tools)+"."), true
+	}
+
+	switch canon {
+	case "read_file":
+		if missingStringArg(tc.Args, "path") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'path'", `Call it as {"path":"file.ext"}.`), true
+		}
+	case "write_file":
+		if missingStringArg(tc.Args, "path") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'path'", `Call it as {"path":"file.ext","content":"..."}.`), true
+		}
+	case "edit_file":
+		if missingStringArg(tc.Args, "path") || missingStringArg(tc.Args, "old_string") {
+			return retryToolCallMessage(tc.Name, "edit_file requires non-empty 'path' and 'old_string' arguments", `Open the file first, then call edit_file with verbatim old_string and the desired new_string.`), true
+		}
+	case "search":
+		if missingStringArg(tc.Args, "pattern") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'pattern'", `Call it as {"pattern":"regex","path":"optional/dir"}.`), true
+		}
+	case "web_search":
+		if missingStringArg(tc.Args, "query") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'query'", `Call it as {"query":"search terms"}.`), true
+		}
+	case "run_command":
+		if missingStringArg(tc.Args, "command") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'command'", `Call it as {"command":"shell command"}.`), true
+		}
+	case "delete":
+		if missingStringArg(tc.Args, "path") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'path'", `Call it as {"path":"file.ext"}.`), true
+		}
+	case "rename":
+		if missingStringArg(tc.Args, "from") || missingStringArg(tc.Args, "to") {
+			return retryToolCallMessage(tc.Name, "rename requires non-empty 'from' and 'to' arguments", `Call it as {"from":"old/path","to":"new/path"}.`), true
+		}
+	case "import_github":
+		if strings.TrimSpace(repoArg(tc.Args)) == "" {
+			return retryToolCallMessage(tc.Name, "missing required 'repo' argument", `Call it as {"repo":"owner/name"}.`), true
+		}
+	case "ask":
+		if missingStringArg(tc.Args, "question") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'question'", `Call it as {"question":"...","options":["..."]}.`), true
+		}
+	case "task":
+		if missingStringArg(tc.Args, "prompt") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'prompt'", `Call it as {"prompt":"self-contained task","description":"short label"}.`), true
+		}
+	case "type_text":
+		if missingStringArg(tc.Args, "text") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'text'", `Call it as {"text":"text to type"}.`), true
+		}
+	case "key_press":
+		if missingStringArg(tc.Args, "key") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'key'", `Call it as {"key":"enter"}.`), true
+		}
+	case "open_app":
+		if missingStringArg(tc.Args, "target") {
+			return retryToolCallMessage(tc.Name, "missing required string argument 'target'", `Call it as {"target":"/path/or/App/or/URL"}.`), true
+		}
+	}
+
+	return "", false
+}
+
+func retryToolCallMessage(name, problem, fix string) string {
+	return "BAD TOOL CALL: nothing was run for " + name + ". No filesystem, shell, or GUI action happened. " +
+		"Where the bot went wrong: " + problem + ". " +
+		"Automatically restarting the tool step: re-emit the corrected <tool name=\"" + name + "\"> call now and then wait for its result. " + fix
+}
+
+// maxBadCallRepeats bounds how many times the agent loops feed back the SAME
+// malformed call before stopping. A model that keeps re-emitting an identical
+// broken call would otherwise burn every remaining round (each one a paid API
+// call) retrying something that cannot succeed.
+const maxBadCallRepeats = 3
+
+// badCallBreaker tracks consecutive identical diagnosed-bad tool calls.
+type badCallBreaker struct {
+	key string
+	n   int
+}
+
+// add records one diagnosed-bad call and reports whether the loop should stop
+// instead of feeding it back yet again.
+func (b *badCallBreaker) add(tc ToolCall) bool {
+	key := tc.Name + "\x00" + fmt.Sprint(tc.Args)
+	if key == b.key {
+		b.n++
+	} else {
+		b.key, b.n = key, 1
+	}
+	return b.n >= maxBadCallRepeats
+}
+
+// reset clears the streak — call it whenever a well-formed call runs.
+func (b *badCallBreaker) reset() { b.key, b.n = "", 0 }
+
+// maxEmptyNudges bounds how many times the agent loops poke the model after it
+// replies with no tool call and no message (pure whitespace, or only a
+// hallucinated <tool_result> block) before giving up.
+const maxEmptyNudges = 2
+
+// emptyReply reports whether a parsed reply carries nothing at all: no tool
+// calls and no user-visible narration. Models occasionally derail into streams
+// of whitespace or hallucinated tool results; ending the turn there looks like
+// the task finished when nothing happened.
+func emptyReply(narration string, calls []ToolCall) bool {
+	return len(calls) == 0 && strings.TrimSpace(narration) == ""
+}
+
+// emptyReplyNudge is fed back as a user message so the model continues instead
+// of the turn silently ending on an empty reply.
+const emptyReplyNudge = "Your previous reply contained no tool call and no message — only whitespace or a stray tool-result block — so nothing happened. " +
+	"Continue the task now: emit the next <tool> call and wait for its result, or if the task is genuinely complete, reply with a short summary."
+
+func missingStringArg(args map[string]any, key string) bool {
+	return strings.TrimSpace(argStr(args, key)) == ""
+}
+
+func knownToolNames(tools []CustomTool) string {
+	names := make([]string, 0, len(builtinToolNames)+len(tools))
+	for name := range builtinToolNames {
+		names = append(names, name)
+	}
+	for _, t := range tools {
+		if strings.TrimSpace(t.Name) != "" {
+			names = append(names, t.Name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) > 40 {
+		names = append(names[:40], "…")
+	}
+	return strings.Join(names, ", ")
+}
+
 // argStr / argBool / argInt safely pull typed values out of the decoded JSON.
 func argStr(a map[string]any, k string) string {
 	if v, ok := a[k].(string); ok {
@@ -131,6 +312,8 @@ func (tc ToolCall) summarize() string {
 		return fmt.Sprintf("list_dir(%s)", p)
 	case "search":
 		return fmt.Sprintf("search(%q)", argStr(tc.Args, "pattern"))
+	case "web_search":
+		return fmt.Sprintf("web_search(%q)", argStr(tc.Args, "query"))
 	case "run_command":
 		return fmt.Sprintf("%s: %s", tc.Name, oneLine(argStr(tc.Args, "command"), 80))
 	case "delete":
@@ -236,11 +419,8 @@ func (tc ToolCall) details(workdir string) string {
 // returned as text (prefixed "Error:") rather than Go errors so the model can
 // read and recover from them.
 func execute(tc ToolCall, workdir string) string {
-	if _, bad := tc.Args["__parse_error"]; bad {
-		raw, _ := tc.Args["__raw"].(string)
-		return fmt.Sprintf("TOOL CALL FAILED: the arguments for %q were not valid JSON, so nothing ran. "+
-			"Re-send the <tool name=%q> call with exactly one valid JSON object (no extra braces, no trailing text). You sent: %s",
-			tc.Name, tc.Name, raw)
+	if out, bad := diagnoseMalformedCall(tc); bad {
+		return out
 	}
 	switch canonicalTool(tc.Name) {
 	case "read_file":
@@ -253,6 +433,8 @@ func execute(tc ToolCall, workdir string) string {
 		return listDirTool(workdir, tc.Args)
 	case "search":
 		return searchTool(workdir, tc.Args)
+	case "web_search":
+		return webSearchTool(tc.Args)
 	case "run_command":
 		return runCommandTool(workdir, tc.Args)
 	case "delete":
@@ -652,6 +834,99 @@ func searchTool(workdir string, a map[string]any) string {
 		return "No matches."
 	}
 	return clip(strings.Join(out, "\n"))
+}
+
+func webSearchTool(a map[string]any) string {
+	query := strings.TrimSpace(argStr(a, "query"))
+	if query == "" {
+		return "Error: web_search requires a 'query'"
+	}
+	limit := argInt(a, "limit")
+	if limit <= 0 || limit > 10 {
+		limit = 5
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	u := "https://www.bing.com/search?q=" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Nocturne/1.0; +https://nocturne.lol)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "Error: web search failed: " + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Sprintf("Error: web search failed: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+
+	results := parseBingResults(string(data), limit)
+	if len(results) == 0 {
+		return "No web results found."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Web search results for %q:\n", query)
+	for i, r := range results {
+		fmt.Fprintf(&b, "\n%d. %s\n   %s", i+1, r.Title, r.URL)
+		if r.Snippet != "" {
+			fmt.Fprintf(&b, "\n   %s", r.Snippet)
+		}
+		b.WriteByte('\n')
+	}
+	return clip(strings.TrimRight(b.String(), "\n"))
+}
+
+type webResult struct {
+	Title   string
+	URL     string
+	Snippet string
+}
+
+var (
+	bingResultRE = regexp.MustCompile(`(?is)<li class="b_algo".*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p[^>]*>(.*?)</p>)?`)
+	htmlTagRE    = regexp.MustCompile(`(?s)<[^>]+>`)
+	whitespaceRE = regexp.MustCompile(`\s+`)
+)
+
+func parseBingResults(page string, limit int) []webResult {
+	matches := bingResultRE.FindAllStringSubmatch(page, -1)
+	results := make([]webResult, 0, min(limit, len(matches)))
+	seen := map[string]bool{}
+	for _, m := range matches {
+		if len(results) >= limit {
+			break
+		}
+		u := cleanHTML(m[1])
+		title := cleanHTML(m[2])
+		snippet := ""
+		if len(m) > 3 {
+			snippet = cleanHTML(m[3])
+		}
+		if title == "" || u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		results = append(results, webResult{Title: title, URL: u, Snippet: snippet})
+	}
+	return results
+}
+
+func cleanHTML(s string) string {
+	s = htmlTagRE.ReplaceAllString(s, " ")
+	s = html.UnescapeString(s)
+	s = whitespaceRE.ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
 }
 
 func isBinary(data []byte) bool {
