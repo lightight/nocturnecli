@@ -28,10 +28,41 @@ func TestSystemPromptTaskTool(t *testing.T) {
 		t.Error("base prompt should not advertise the task tool")
 	}
 	on := systemPromptMode("/tmp/work", false, false, false, true)
-	for _, want := range []string{"Sub-agents", "task", "sub-agent", "prompt"} {
+	for _, want := range []string{"Sub-agents", "task", "sub-agent", "prompt", "background", "concurrently"} {
 		if !strings.Contains(on, want) {
 			t.Errorf("extended-level prompt missing %q", want)
 		}
+	}
+}
+
+func TestTaskSpecsFromArgs(t *testing.T) {
+	m := &tuiModel{}
+
+	single := m.taskSpecsFromArgs(map[string]interface{}{"prompt": "do a", "description": "Task A"})
+	if len(single) != 1 || single[0].Prompt != "do a" || single[0].Label != "Task A" {
+		t.Errorf("single prompt spec = %+v", single)
+	}
+
+	batch := m.taskSpecsFromArgs(map[string]interface{}{
+		"tasks": []interface{}{
+			map[string]interface{}{"prompt": "do a", "description": "Task A"},
+			"do b",
+		},
+	})
+	if len(batch) != 2 || batch[0].Prompt != "do a" || batch[1].Prompt != "do b" {
+		t.Errorf("batch specs = %+v", batch)
+	}
+	if batch[1].Label != "do b" {
+		t.Errorf("string task should fall back to prompt as label, got %q", batch[1].Label)
+	}
+
+	prompts := m.taskSpecsFromArgs(map[string]interface{}{"prompts": []interface{}{"x", "y"}})
+	if len(prompts) != 2 {
+		t.Errorf("prompts specs = %+v", prompts)
+	}
+
+	if got := m.taskSpecsFromArgs(map[string]interface{}{"description": "no prompt"}); len(got) != 0 {
+		t.Errorf("empty prompt should yield no specs, got %+v", got)
 	}
 }
 

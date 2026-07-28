@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -67,7 +68,7 @@ var slashCommands = []slashItem{
 	{"/key", "save your API key (remembered everywhere)"},
 	{"/tools", "list installed custom tools"},
 	{"/report", "anonymous e2e-encrypted debug report — view · send · never"},
-	{"/tool-import", "install custom tools from a provider JSON path/URL"},
+	{"/tool-import", "install a tool/skill from one URL or path"},
 	{"/tool-add", "install one custom shell tool"},
 	{"/tool-remove", "remove an installed custom tool"},
 	{"/image", "attach an image file"},
@@ -77,6 +78,7 @@ var slashCommands = []slashItem{
 	{"/plan", "plan mode — read-only exploration, approve to execute"},
 	{"/goal", "goal mode — autonomous long-running task mode"},
 	{"/compact", "summarize the conversation to free up context"},
+	{"/skip-questions", "toggle auto-skipping AI question popups"},
 	{"/resume", "resume a saved chat from this directory"},
 	{"/new", "start a new chat"},
 	{"/remote", "control this session from your browser (paired, e2e-encrypted)"},
@@ -189,8 +191,14 @@ type tuiModel struct {
 	party     bool
 	partyTick int
 
-	// completed background commands waiting to be handed back to the AI
+	// completed background commands/sub-agent batches waiting to be handed back to the AI
 	backgroundDone []backgroundCommandResult
+	subagentDone   []subagentBatchResult
+
+	// compact sub-agent progress grid
+	subagents      map[string]*subagentBatchView
+	subagentOrder  []string
+	nextSubagentID int
 
 	// /remote connection progress (async handshake with the relay)
 	remoteConnecting bool
@@ -329,6 +337,48 @@ type remoteReadyMsg struct {
 
 type backgroundCommandDoneMsg struct{ result backgroundCommandResult }
 
+type subagentTaskSpec struct {
+	ID     string
+	Prompt string
+	Label  string
+}
+
+type subagentTaskState struct {
+	ID      string
+	Label   string
+	Percent int
+	Latest  string
+	Done    bool
+	Err     string
+}
+
+type subagentBatchView struct {
+	ID         string
+	Label      string
+	Background bool
+	Started    time.Time
+	Tasks      []*subagentTaskState
+}
+
+type subagentProgressMsg struct {
+	BatchID string
+	TaskID  string
+	Percent int
+	Latest  string
+	Done    bool
+	Err     string
+}
+
+type subagentBatchResult struct {
+	BatchID    string
+	Background bool
+	Report     string
+}
+
+type subagentBatchDoneMsg struct {
+	Result subagentBatchResult
+}
+
 func remoteTickCmd() tea.Cmd {
 	return tea.Tick(90*time.Millisecond, func(time.Time) tea.Msg { return remoteTickMsg{} })
 }
@@ -366,6 +416,7 @@ func newModel(cfg *Config, version string) *tuiModel {
 		sessionID: newSessionID(), sessionStart: time.Now(),
 		health:          newHealthTracker(),
 		remoteDraftSent: "\xff",
+		subagents:       map[string]*subagentBatchView{},
 	}
 	m.rebuildRenderer()
 	return m
@@ -407,10 +458,9 @@ func startTUI(cfg *Config, version string, cowork bool) error {
 
 	m := newModel(cfg, version)
 	m.cowork = cowork
-	// Mouse is always enabled so wheel scrolling works in the alt screen. We only
-	// handle wheel events and ignore drag/release events so terminals can still
-	// use their native text selection behavior where supported.
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithFilter(filterLeaks))
+	// Leave terminal mouse reporting disabled so native click-drag text selection
+	// works. Scrolling is handled by the terminal/viewport keybindings instead.
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(filterLeaks))
 	m.program = p
 	_, err := p.Run()
 	m.remote.Stop()
@@ -533,6 +583,13 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toolDoneMsg:
 		return m.handleToolDone(msg)
+
+	case subagentProgressMsg:
+		m.handleSubagentProgress(msg)
+		return m, nil
+
+	case subagentBatchDoneMsg:
+		return m.handleSubagentBatchDone(msg.Result)
 
 	case backgroundCommandDoneMsg:
 		return m.handleBackgroundCommandDone(msg.result)
@@ -1169,6 +1226,9 @@ func (m *tuiModel) settleIdleCmd() tea.Cmd {
 	if len(m.backgroundDone) > 0 {
 		return m.startBackgroundCommandReply()
 	}
+	if len(m.subagentDone) > 0 {
+		return m.startBackgroundSubagentReply()
+	}
 	if m.shouldAutoCompact() {
 		return m.compactCmd(true)
 	}
@@ -1284,35 +1344,182 @@ func (m *tuiModel) runToolCmd(tc ToolCall) tea.Cmd {
 	}
 }
 
-// runTaskCmd runs the task tool: a nested sub-agent loop whose final report
-// becomes the tool result. Reached via runToolCmd's dispatch, so every approval
-// path (ask / smart / bypass) lands here the same way.
+// runTaskCmd runs one or more nested sub-agent loops. Args may be either the
+// classic {"prompt":"...","description":"..."} shape or a batch:
+// {"tasks":[{"prompt":"...","description":"..."}],"background":true}.
 func (m *tuiModel) runTaskCmd(tc ToolCall) tea.Cmd {
-	m.push(stHint.Render("  ⏳ sub-agent working: " + oneLine(firstNonEmpty(argStr(tc.Args, "description"), argStr(tc.Args, "prompt")), 80)))
+	tasks := m.taskSpecsFromArgs(tc.Args)
+	if len(tasks) == 0 {
+		return func() tea.Msg {
+			return toolDoneMsg{name: tc.Name, output: "Error: task requires a prompt or non-empty tasks array"}
+		}
+	}
+	m.nextSubagentID++
+	batchID := fmt.Sprintf("subagents-%d", m.nextSubagentID)
+	background := argBool(tc.Args, "background") || strings.EqualFold(argStr(tc.Args, "mode"), "background")
+	if argBool(tc.Args, "wait") {
+		background = false
+	}
+	m.registerSubagentBatch(batchID, tasks, background)
+	where := ""
+	if background {
+		where = " in background"
+	}
+	m.push(stHint.Render(fmt.Sprintf("  ⏳ %d sub-agent%s started%s", len(tasks), plural(len(tasks)), where)))
 	cfg := m.cfg
 	client := m.client
 	work := m.work
-	prompt := argStr(tc.Args, "prompt")
+	goal := m.goal
+	program := m.program
 	return func() tea.Msg {
-		timeout := 10 * time.Minute
-		maxRounds := maxSubagentRounds
-		if m.goal {
-			timeout = goalSubagentTimeout
-			maxRounds = goalSubagentRounds
+		result := runSubagentBatch(batchID, tasks, background, goal, cfg, client, work, program)
+		if background {
+			if program != nil {
+				program.Send(subagentBatchDoneMsg{Result: result})
+			}
+			return toolDoneMsg{name: tc.Name, output: fmt.Sprintf("Started %d background sub-agent%s. The CLI will report back when all are finished.", len(tasks), plural(len(tasks)))}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		report, err := runSubagentWithLimit(ctx, cfg, client, work, prompt, maxRounds)
-		if err != nil {
-			return toolDoneMsg{name: tc.Name, output: "Error: " + oneLine(err.Error(), 400)}
-		}
-		return toolDoneMsg{name: tc.Name, output: report}
+		return toolDoneMsg{name: tc.Name, output: result.Report}
 	}
 }
 
 // pushToolCall prints a tool-call header.
 func (m *tuiModel) pushToolCall(tc ToolCall) {
 	m.push(renderToolCall(tc))
+}
+
+func (m *tuiModel) taskSpecsFromArgs(args map[string]interface{}) []subagentTaskSpec {
+	var specs []subagentTaskSpec
+	add := func(prompt, label string) {
+		prompt = strings.TrimSpace(prompt)
+		if prompt == "" {
+			return
+		}
+		label = strings.TrimSpace(label)
+		if label == "" {
+			label = prompt
+		}
+		specs = append(specs, subagentTaskSpec{ID: fmt.Sprintf("t%d", len(specs)+1), Prompt: prompt, Label: oneLine(label, 70)})
+	}
+	if raw, ok := args["tasks"]; ok {
+		for _, it := range toInterfaceSlice(raw) {
+			switch v := it.(type) {
+			case string:
+				add(v, "")
+			case map[string]interface{}:
+				add(argStr(v, "prompt"), firstNonEmpty(argStr(v, "description"), argStr(v, "label")))
+			}
+		}
+	}
+	if raw, ok := args["prompts"]; ok {
+		for _, it := range toInterfaceSlice(raw) {
+			if s, ok := it.(string); ok {
+				add(s, "")
+			}
+		}
+	}
+	add(argStr(args, "prompt"), firstNonEmpty(argStr(args, "description"), argStr(args, "label")))
+	return specs
+}
+
+func toInterfaceSlice(v interface{}) []interface{} {
+	switch x := v.(type) {
+	case []interface{}:
+		return x
+	case []string:
+		out := make([]interface{}, len(x))
+		for i, s := range x {
+			out[i] = s
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func (m *tuiModel) registerSubagentBatch(batchID string, tasks []subagentTaskSpec, background bool) {
+	if m.subagents == nil {
+		m.subagents = map[string]*subagentBatchView{}
+	}
+	view := &subagentBatchView{ID: batchID, Background: background, Started: time.Now()}
+	for _, t := range tasks {
+		view.Tasks = append(view.Tasks, &subagentTaskState{ID: t.ID, Label: t.Label, Percent: 1, Latest: "queued"})
+	}
+	m.subagents[batchID] = view
+	m.subagentOrder = append(m.subagentOrder, batchID)
+}
+
+func runSubagentBatch(batchID string, tasks []subagentTaskSpec, background, goal bool, cfg *Config, client *Client, work string, program *tea.Program) subagentBatchResult {
+	timeout := 10 * time.Minute
+	maxRounds := maxSubagentRounds
+	if goal {
+		timeout = goalSubagentTimeout
+		maxRounds = goalSubagentRounds
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	type itemResult struct {
+		idx    int
+		label  string
+		report string
+		err    error
+	}
+	results := make([]itemResult, len(tasks))
+	ch := make(chan itemResult, len(tasks))
+	var wg sync.WaitGroup
+	for i, task := range tasks {
+		i, task := i, task
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			send := func(p subagentProgress) {
+				if program != nil {
+					program.Send(subagentProgressMsg{BatchID: batchID, TaskID: task.ID, Percent: p.Percent, Latest: p.Latest})
+				}
+			}
+			report, err := runSubagentWithProgress(ctx, cfg, client, work, task.Prompt, maxRounds, send)
+			latest := "finished"
+			if err != nil {
+				latest = "failed: " + oneLine(err.Error(), 90)
+			}
+			if program != nil {
+				program.Send(subagentProgressMsg{BatchID: batchID, TaskID: task.ID, Percent: 100, Latest: latest, Done: true, Err: errString(err)})
+			}
+			ch <- itemResult{idx: i, label: task.Label, report: report, err: err}
+		}()
+	}
+	wg.Wait()
+	close(ch)
+	for r := range ch {
+		results[r.idx] = r
+	}
+	var b strings.Builder
+	if background {
+		b.WriteString("Background sub-agent batch completed. Continue responding to the user based on these results.\n")
+	} else {
+		b.WriteString("Sub-agent batch completed.\n")
+	}
+	for _, r := range results {
+		b.WriteString("\n## ")
+		b.WriteString(r.label)
+		b.WriteString("\n")
+		if r.err != nil {
+			b.WriteString("Error: ")
+			b.WriteString(r.err.Error())
+			b.WriteString("\n")
+			continue
+		}
+		b.WriteString(strings.TrimSpace(r.report))
+		b.WriteString("\n")
+	}
+	return subagentBatchResult{BatchID: batchID, Background: background, Report: strings.TrimSpace(b.String())}
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (m *tuiModel) startSpinner() tea.Cmd {
@@ -1721,6 +1928,22 @@ func (m *tuiModel) beginAsk(tc ToolCall) tea.Cmd {
 	if len(m.askOpts) == 0 {
 		m.askOpts = []string{"Yes", "No"}
 	}
+	if m.cfg.SkipQuestions {
+		if len(m.pending) > 0 {
+			m.pending = m.pending[1:]
+		}
+		out := "Question skipped because /skip-questions is on. Continue with the safest reasonable default, or proceed without that information if possible. Question was: " + m.askQ
+		if len(m.askOpts) > 0 {
+			out += " Options: " + strings.Join(m.askOpts, ", ")
+		}
+		m.results = append(m.results, toolResult{Name: "ask", Output: out})
+		m.push(stHint.Render("  ↷ question skipped (/skip-questions on): " + oneLine(m.askQ, 120)))
+		m.toRemote("tool", "  └ question skipped")
+		m.askQ = ""
+		m.askOpts = nil
+		m.askSel = 0
+		return m.advanceTools()
+	}
 	m.askSel = 0
 	m.mode = modeAsk
 	m.toRemote("status", "waiting for an answer in the terminal: "+m.askQ)
@@ -1756,6 +1979,53 @@ func (m *tuiModel) handleToolDone(msg toolDoneMsg) (tea.Model, tea.Cmd) {
 	return m, m.advanceTools()
 }
 
+func (m *tuiModel) handleSubagentProgress(msg subagentProgressMsg) {
+	b := m.subagents[msg.BatchID]
+	if b == nil {
+		return
+	}
+	for _, t := range b.Tasks {
+		if t.ID != msg.TaskID {
+			continue
+		}
+		t.Percent = msg.Percent
+		t.Latest = msg.Latest
+		t.Done = msg.Done
+		t.Err = msg.Err
+		break
+	}
+	m.syncViewport()
+}
+
+func (m *tuiModel) handleSubagentBatchDone(r subagentBatchResult) (tea.Model, tea.Cmd) {
+	m.markSubagentBatchDone(r.BatchID)
+	m.push(renderToolResult("Background sub-agent batch finished.\n" + r.Report))
+	m.toRemote("tool", "  └ background sub-agents finished")
+	cmd := waitBackgroundCommandDoneCmd()
+	if m.busy() || m.mode != modeInput {
+		m.subagentDone = append(m.subagentDone, r)
+		return m, cmd
+	}
+	m.subagentDone = append(m.subagentDone, r)
+	return m, tea.Batch(cmd, m.startBackgroundSubagentReply())
+}
+
+func (m *tuiModel) markSubagentBatchDone(batchID string) {
+	b := m.subagents[batchID]
+	if b == nil {
+		return
+	}
+	for _, t := range b.Tasks {
+		t.Done = true
+		if t.Percent < 100 {
+			t.Percent = 100
+		}
+		if t.Latest == "" || t.Latest == "queued" {
+			t.Latest = "finished"
+		}
+	}
+}
+
 func (m *tuiModel) handleBackgroundCommandDone(r backgroundCommandResult) (tea.Model, tea.Cmd) {
 	m.push(renderToolResult(formatBackgroundCommandNotification(r)))
 	m.toRemote("tool", "  └ background finished: "+oneLine(r.Command, 80))
@@ -1775,6 +2045,16 @@ func (m *tuiModel) startBackgroundCommandReply() tea.Cmd {
 	r := m.backgroundDone[0]
 	m.backgroundDone = m.backgroundDone[1:]
 	m.messages = append(m.messages, ChatMessage{Role: "user", Content: buildBackgroundCommandResult(r)})
+	return m.startReply()
+}
+
+func (m *tuiModel) startBackgroundSubagentReply() tea.Cmd {
+	if len(m.subagentDone) == 0 || m.busy() || m.mode != modeInput {
+		return nil
+	}
+	r := m.subagentDone[0]
+	m.subagentDone = m.subagentDone[1:]
+	m.messages = append(m.messages, ChatMessage{Role: "user", Content: r.Report})
 	return m.startReply()
 }
 
@@ -2399,10 +2679,70 @@ func (m *tuiModel) bottomView() string {
 		b.WriteString(stDim.Render(" — add a message and press enter"))
 		b.WriteString("\n")
 	}
+	if grid := m.subagentGridView(); grid != "" {
+		b.WriteString(grid)
+		b.WriteString("\n")
+	}
 	b.WriteString(m.inputBox())
 	b.WriteString("\n")
 	b.WriteString(m.statusLine())
 	return b.String()
+}
+
+func (m *tuiModel) subagentGridView() string {
+	if len(m.subagentOrder) == 0 {
+		return ""
+	}
+	var rows []string
+	for _, id := range m.subagentOrder {
+		b := m.subagents[id]
+		if b == nil {
+			continue
+		}
+		active := false
+		for _, t := range b.Tasks {
+			if !t.Done {
+				active = true
+				break
+			}
+		}
+		if !active {
+			continue
+		}
+		for _, t := range b.Tasks {
+			mark := "◌"
+			style := stHint
+			if t.Done {
+				mark = "✓"
+				style = stOK
+			}
+			if t.Err != "" {
+				mark = "✗"
+				style = stErr
+			}
+			latest := t.Latest
+			if latest == "" {
+				latest = "working"
+			}
+			rows = append(rows, fmt.Sprintf("%s %3d%% %s — %s", style.Render(mark), t.Percent, oneLine(t.Label, 34), stDim.Render(oneLine(latest, 54))))
+		}
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	if len(rows) > 8 {
+		rows = append(rows[:8], stDim.Render(fmt.Sprintf("  … %d more sub-agents", len(rows)-8)))
+	}
+	w := m.width - 2
+	if w < 10 {
+		w = 10
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colPrimary).
+		Padding(0, 1).
+		Width(w).
+		Render(stTitle.Render("Sub-agents") + "\n" + strings.Join(rows, "\n"))
 }
 
 func (m *tuiModel) inputContentWidth() int {
@@ -2493,12 +2833,12 @@ func (m *tuiModel) statusLine() string {
 	}
 	switch m.mode {
 	case modeThinking:
-		return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("Thinking… (%s · esc to interrupt)", m.elapsed()))
+		return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("Thinking… (%s · esc to interrupt)", m.elapsed())) + stHint.Render(" · "+m.contextUsageString())
 	case modeStreaming:
 		if strings.TrimSpace(m.streamBuf) == "" {
-			return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("Thinking… (%s · esc to interrupt)", m.elapsed()))
+			return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("Thinking… (%s · esc to interrupt)", m.elapsed())) + stHint.Render(" · "+m.contextUsageString())
 		}
-		return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("streaming… (%s · esc to interrupt)", m.elapsed()))
+		return " " + m.sp.View() + " " + stDim.Render(fmt.Sprintf("streaming… (%s · esc to interrupt)", m.elapsed())) + stHint.Render(" · "+m.contextUsageString())
 	default:
 		scroll := "wheel/pgup/pgdn scroll · drag selects"
 		line := "  " + m.contextUsageString() + " · enter ↵ send · alt+↵ newline · ctrl+v paste image · " + scroll + " · / commands"
@@ -2881,6 +3221,42 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 		m.push(m.customToolsList())
 	case "/report":
 		return m.runReportSlash(arg)
+	case "/skip-questions", "/questions":
+		valid := true
+		switch strings.ToLower(arg) {
+		case "", "toggle":
+			m.cfg.SkipQuestions = !m.cfg.SkipQuestions
+		case "on", "true", "1", "yes":
+			m.cfg.SkipQuestions = true
+		case "off", "false", "0", "no":
+			m.cfg.SkipQuestions = false
+		default:
+			valid = false
+		}
+		if !valid {
+			m.push(stErr.Render("  usage: /skip-questions [on|off]"))
+			break
+		}
+		if err := m.cfg.Save(); err != nil {
+			m.push(stErr.Render("  couldn't save setting: " + err.Error()))
+			break
+		}
+		if m.cfg.SkipQuestions {
+			m.push(stOK.Render("  AI question popups will be skipped"))
+		} else {
+			m.push(stHint.Render("  AI question popups enabled"))
+		}
+	case "/tool-import":
+		if arg == "" {
+			m.push(stErr.Render("  usage: /tool-import <tool-or-skill-url-or-path>"))
+			break
+		}
+		msg, err := installSkill(m.cfg, arg)
+		if err != nil {
+			m.push(stErr.Render("  couldn't import tool: " + err.Error()))
+			break
+		}
+		m.push(stOK.Render("  tool imported — " + msg))
 	case "/install":
 		if arg == "" {
 			m.push(stErr.Render("  usage: /install <skill-url-or-path>"))
@@ -2892,21 +3268,7 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.push(stOK.Render("  " + msg))
-	case "/tool-import", "/tools-import":
-		if arg == "" {
-			m.push(stErr.Render("  usage: /tool-import <provider.json path-or-url>"))
-			break
-		}
-		n, err := importToolProvider(m.cfg, arg)
-		if err != nil {
-			m.push(stErr.Render("  couldn't import tools: " + err.Error()))
-			break
-		}
-		if err := m.cfg.Save(); err != nil {
-			m.push(stErr.Render("  imported but couldn't save config: " + err.Error()))
-			break
-		}
-		m.push(stOK.Render(fmt.Sprintf("  installed %d custom tool(s)", n)))
+
 	case "/tool-remove", "/tools-remove":
 		if arg == "" {
 			m.push(stErr.Render("  usage: /tool-remove <name>"))

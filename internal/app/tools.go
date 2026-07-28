@@ -175,6 +175,10 @@ func diagnoseBadToolCall(tc ToolCall, tools []CustomTool) (string, bool) {
 		if strings.TrimSpace(repoArg(tc.Args)) == "" {
 			return retryToolCallMessage(tc.Name, "missing required 'repo' argument", `Call it as {"repo":"owner/name"}.`), true
 		}
+	case "install_skill":
+		if strings.TrimSpace(skillURLArg(tc.Args)) == "" {
+			return retryToolCallMessage(tc.Name, "missing required 'url' argument", `Call it as {"url":"https://..."}.`), true
+		}
 	case "ask":
 		if missingStringArg(tc.Args, "question") {
 			return retryToolCallMessage(tc.Name, "missing required string argument 'question'", `Call it as {"question":"...","options":["..."]}.`), true

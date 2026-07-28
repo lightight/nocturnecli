@@ -275,6 +275,8 @@ const COMMANDS = [
 	  {name:'/permissions',desc:'how tool actions are approved (ask · auto · bypass)'},
 	  {name:'/btw',        desc:'by the way — add a note without breaking flow'},
 	  {name:'/key',        desc:'save your API key (remembered everywhere)'},
+	  {name:'/tool-import',desc:'install a tool/skill from one URL or path'},
+	  {name:'/skip-questions', desc:'toggle auto-skipping AI question popups'},
 	  {name:'/image',      desc:'attach an image file — /image <path>'},
 	  {name:'/cd',         desc:'change the working directory'},
 	  {name:'/usage',      desc:'usage & quota — sent as a text summary'},

@@ -59,16 +59,17 @@ var envKeys = []string{"NOCTURNE_API", "NOCTURNE_API_KEY", "NOCTURE_API"}
 // .env file. The .env ranks last so a stale project .env can't silently
 // override a key the user deliberately saved.
 type Config struct {
-	APIKey       string       `json:"api_key,omitempty"`
-	Model        string       `json:"model,omitempty"`
-	BaseURL      string       `json:"base_url,omitempty"`
-	Stream       bool         `json:"stream"`                  // live-stream replies (default true)
-	Level        string       `json:"level,omitempty"`         // thinking: off · normal · extended
-	Perm         string       `json:"perm,omitempty"`          // approval mode: ask · smart · bypass
-	Temperature  *float64     `json:"temperature,omitempty"`   // 0–2 (unset = API default)
-	Trusted      []string     `json:"trusted,omitempty"`       // absolute paths the user has trusted
-	Tools        []CustomTool `json:"tools,omitempty"`         // user-installed shell-backed tools
-	ReportOptOut bool         `json:"report_optout,omitempty"` // never show anonymous-report hints
+	APIKey        string       `json:"api_key,omitempty"`
+	Model         string       `json:"model,omitempty"`
+	BaseURL       string       `json:"base_url,omitempty"`
+	Stream        bool         `json:"stream"`                   // live-stream replies (default true)
+	Level         string       `json:"level,omitempty"`          // thinking: off · normal · extended
+	Perm          string       `json:"perm,omitempty"`           // approval mode: ask · smart · bypass
+	Temperature   *float64     `json:"temperature,omitempty"`    // 0–2 (unset = API default)
+	Trusted       []string     `json:"trusted,omitempty"`        // absolute paths the user has trusted
+	Tools         []CustomTool `json:"tools,omitempty"`          // user-installed shell-backed tools
+	ReportOptOut  bool         `json:"report_optout,omitempty"`  // never show anonymous-report hints
+	SkipQuestions bool         `json:"skip_questions,omitempty"` // auto-skip AI ask-tool popups
 
 	path           string // resolved config-file path (not serialized)
 	keyFromEnv     bool   // true when APIKey came from the environment or a .env
@@ -80,18 +81,19 @@ type persisted struct {
 	// APIKey is the legacy plaintext field. New saves write APIKeyEnc instead;
 	// loads still accept APIKey so existing users migrate automatically after the
 	// next Save().
-	APIKey       string       `json:"api_key,omitempty"`
-	APIKeyEnc    string       `json:"api_key_enc,omitempty"`
-	APIKeyHash   string       `json:"api_key_hash,omitempty"`
-	Model        string       `json:"model,omitempty"`
-	BaseURL      string       `json:"base_url,omitempty"`
-	Stream       *bool        `json:"stream,omitempty"` // pointer so "absent" stays default-on
-	Level        string       `json:"level,omitempty"`
-	Perm         string       `json:"perm,omitempty"`
-	Temperature  *float64     `json:"temperature,omitempty"`
-	Trusted      []string     `json:"trusted,omitempty"`
-	Tools        []CustomTool `json:"tools,omitempty"`
-	ReportOptOut bool         `json:"report_optout,omitempty"`
+	APIKey        string       `json:"api_key,omitempty"`
+	APIKeyEnc     string       `json:"api_key_enc,omitempty"`
+	APIKeyHash    string       `json:"api_key_hash,omitempty"`
+	Model         string       `json:"model,omitempty"`
+	BaseURL       string       `json:"base_url,omitempty"`
+	Stream        *bool        `json:"stream,omitempty"` // pointer so "absent" stays default-on
+	Level         string       `json:"level,omitempty"`
+	Perm          string       `json:"perm,omitempty"`
+	Temperature   *float64     `json:"temperature,omitempty"`
+	Trusted       []string     `json:"trusted,omitempty"`
+	Tools         []CustomTool `json:"tools,omitempty"`
+	ReportOptOut  bool         `json:"report_optout,omitempty"`
+	SkipQuestions bool         `json:"skip_questions,omitempty"`
 }
 
 // configDir returns the directory that holds Nocturne's config file,
@@ -144,6 +146,7 @@ func loadConfig(path string) *Config {
 			cfg.Trusted = p.Trusted
 			cfg.Tools = normalizeCustomTools(p.Tools)
 			cfg.ReportOptOut = p.ReportOptOut
+			cfg.SkipQuestions = p.SkipQuestions
 			if p.APIKeyEnc != "" {
 				if k, err := decryptAPIKey(p.APIKeyEnc); err == nil && k != "" {
 					cfg.APIKey = k
@@ -276,7 +279,7 @@ func (c *Config) Save() error {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
 		return err
 	}
-	p := persisted{Model: normalizeModelID(c.Model), BaseURL: c.BaseURL, Stream: &c.Stream, Level: c.Level, Perm: normalizePerm(c.Perm), Temperature: c.Temperature, Trusted: c.Trusted, Tools: normalizeCustomTools(c.Tools), ReportOptOut: c.ReportOptOut}
+	p := persisted{Model: normalizeModelID(c.Model), BaseURL: c.BaseURL, Stream: &c.Stream, Level: c.Level, Perm: normalizePerm(c.Perm), Temperature: c.Temperature, Trusted: c.Trusted, Tools: normalizeCustomTools(c.Tools), ReportOptOut: c.ReportOptOut, SkipQuestions: c.SkipQuestions}
 	if !c.keyFromEnv && c.APIKey != "" {
 		enc, err := encryptAPIKey(c.APIKey)
 		if err != nil {

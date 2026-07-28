@@ -96,6 +96,19 @@ func TestLegacyPlaintextKeyMigratesToEncrypted(t *testing.T) {
 	}
 }
 
+func TestSkipQuestionsRoundTrip(t *testing.T) {
+	neutralizeEnvKeys(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+
+	cfg := &Config{path: path, Model: DefaultModel, BaseURL: DefaultBaseURL, Stream: true, SkipQuestions: true}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if got := loadConfig(path); !got.SkipQuestions {
+		t.Fatal("SkipQuestions should persist across Save/loadConfig")
+	}
+}
+
 func TestKeyNeedsPersist(t *testing.T) {
 	cases := []struct {
 		name string

@@ -514,11 +514,19 @@ Goal mode is ON. Work autonomously until the user's objective is complete or you
   goal is complete and verified, or when blocked with a clear reason and next step.`
 
 const taskTemplate = `# Sub-agents — the task tool
-- task — delegate a self-contained sub-task to a sub-agent with its own agent loop and full
-  tool access (aliases: agent, subagent). Args: {"prompt": string, "description"?: string}.
-  Use it for independent chunks of work that need many steps; the sub-agent runs with extended
+- task — delegate self-contained sub-tasks to sub-agents, each with its own agent loop and full
+  tool access (aliases: agent, subagent). Args:
+    {"prompt": string, "description"?: string} — a single sub-task, or
+    {"tasks": [{"prompt": string, "description"?: string}, …], "background"?: bool} — several
+    sub-agents running concurrently (a plain ["…", "…"] "prompts" array works too).
+  By default the call blocks until every sub-agent finishes and all reports come back as one
+  tool result. With "background": true it returns immediately and the CLI hands you the
+  combined report as a later message when all of them are done — keep helping the user in the
+  meantime, and don't claim their results before that report arrives. The user sees a compact
+  live grid with each sub-agent's progress while they run.
+  Use it for independent chunks of work that need many steps; each sub-agent runs with extended
   thinking and its final report comes back as the tool result. Do not delegate work you can
-  do yourself in a step or two, and make the prompt fully self-contained — the sub-agent
+  do yourself in a step or two, and make every prompt fully self-contained — the sub-agents
   can't see this conversation.`
 
 const coworkTemplate = `# Cowork mode — computer use
