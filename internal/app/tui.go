@@ -1389,6 +1389,10 @@ func (m *tuiModel) pushToolCall(tc ToolCall) {
 }
 
 func (m *tuiModel) taskSpecsFromArgs(args map[string]interface{}) []subagentTaskSpec {
+	return taskSpecsFromArgs(args)
+}
+
+func taskSpecsFromArgs(args map[string]interface{}) []subagentTaskSpec {
 	var specs []subagentTaskSpec
 	add := func(prompt, label string) {
 		prompt = strings.TrimSpace(prompt)

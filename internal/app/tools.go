@@ -184,8 +184,8 @@ func diagnoseBadToolCall(tc ToolCall, tools []CustomTool) (string, bool) {
 			return retryToolCallMessage(tc.Name, "missing required string argument 'question'", `Call it as {"question":"...","options":["..."]}.`), true
 		}
 	case "task":
-		if missingStringArg(tc.Args, "prompt") {
-			return retryToolCallMessage(tc.Name, "missing required string argument 'prompt'", `Call it as {"prompt":"self-contained task","description":"short label"}.`), true
+		if len(taskSpecsFromArgs(tc.Args)) == 0 {
+			return retryToolCallMessage(tc.Name, "missing task input: provide either a non-empty 'prompt', a non-empty 'tasks' array, or a non-empty 'prompts' array", `Call it as {"prompt":"self-contained task","description":"short label"} or {"tasks":[{"prompt":"task A"},{"prompt":"task B"}],"background":true}.`), true
 		}
 	case "type_text":
 		if missingStringArg(tc.Args, "text") {

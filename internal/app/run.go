@@ -296,12 +296,14 @@ func runHeadlessLoop(cfg *Config, prompt string, cowork bool, health *healthTrac
 						Output: "the task tool requires thinking level 'extended' — set it with /level extended"})
 					continue
 				}
-				report, err := runSubagent(context.Background(), cfg, client, work, argStr(tc.Args, "prompt"))
-				if err != nil {
-					results = append(results, toolResult{Name: tc.Name, Output: "Error: " + oneLine(err.Error(), 400)})
-				} else {
-					results = append(results, toolResult{Name: tc.Name, Output: report})
+				tasks := taskSpecsFromArgs(tc.Args)
+				if len(tasks) == 0 {
+					results = append(results, toolResult{Name: tc.Name, Output: "Error: task requires a prompt or non-empty tasks array"})
+					continue
 				}
+				batchID := fmt.Sprintf("headless-subagents-%d", round)
+				result := runSubagentBatch(batchID, tasks, false, false, cfg, client, work, nil)
+				results = append(results, toolResult{Name: tc.Name, Output: result.Report})
 				continue
 			}
 			if canonicalTool(tc.Name) == "install_skill" {
