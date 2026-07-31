@@ -52,6 +52,9 @@ const maxInputRows = 10
 const (
 	goalSubagentTimeout = 8 * time.Hour
 	goalSubagentRounds  = 100
+	// maxStreamRecoveries bounds automatic retries after an interrupted stream so
+	// a persistently failing upstream cannot loop and burn API calls forever.
+	maxStreamRecoveries = 2
 )
 
 // slashItem is one entry in the "/" command menu.
@@ -116,12 +119,13 @@ type tuiModel struct {
 	attachments []Image
 	queuedInput []string // prompts/slash commands submitted while the agent is busy
 
-	pending     []ToolCall
-	results     []toolResult
-	confirm     ToolCall
-	guardReason string // why the guard flagged m.confirm (empty for a plain ask)
-	emptyNudges int    // consecutive empty-reply nudges sent this turn
-	badCalls    badCallBreaker
+	pending          []ToolCall
+	results          []toolResult
+	confirm          ToolCall
+	guardReason      string // why the guard flagged m.confirm (empty for a plain ask)
+	emptyNudges      int    // consecutive empty-reply nudges sent this turn
+	streamRecoveries int    // consecutive interrupted-stream retries this turn
+	badCalls         badCallBreaker
 
 	// anonymous problem reports (opt-in, e2e-encrypted)
 	health      *healthTracker
@@ -458,10 +462,14 @@ func startTUI(cfg *Config, version string, cowork bool) error {
 
 	m := newModel(cfg, version)
 	m.cowork = cowork
-	// Enable terminal mouse reporting so wheel events reach the viewport while in
-	// the alt-screen (which has no native scrollback). Non-wheel mouse events are
-	// ignored in Update so clicks don't affect the UI.
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithFilter(filterLeaks))
+	// In the alt-screen there is no native scrollback. Instead of enabling full
+	// mouse tracking (which steals drag selection from the terminal), ask xterm-
+	// compatible terminals to translate wheel events into cursor keys while the
+	// alt-screen is active. This preserves normal click/drag text selection.
+	fmt.Fprint(os.Stdout, "\x1b[?1007h")
+	defer fmt.Fprint(os.Stdout, "\x1b[?1007l")
+
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(filterLeaks))
 	m.program = p
 	_, err := p.Run()
 	m.remote.Stop()
@@ -1174,6 +1182,7 @@ func (m *tuiModel) submit() (tea.Model, tea.Cmd) {
 
 func (m *tuiModel) submitText(text string) (tea.Model, tea.Cmd) {
 	m.follow = true
+	m.streamRecoveries = 0
 	m.messages = append(m.messages, ChatMessage{Role: "user", Content: text})
 	m.noteTitle(text)
 	m.push(renderUser(text, 0, m.width))
@@ -1188,11 +1197,40 @@ func (m *tuiModel) queueBusyDraft() (tea.Model, tea.Cmd) {
 	m.ta.Reset()
 	m.showSlash = false
 	m.refreshSlash()
-	if strings.HasPrefix(raw, "/") {
+	if strings.HasPrefix(raw, "/") && !m.slashStartsReply(raw) {
 		return m.runSlash(raw, false)
 	}
 	m.queueText(raw)
 	return m, nil
+}
+
+// slashStartsReply reports whether a slash command would start another agent
+// request. While a turn is busy those commands must queue like normal prompts;
+// running them immediately would replace the active stream and mix replies.
+func (m *tuiModel) slashStartsReply(raw string) bool {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := strings.ToLower(fields[0])
+	arg := strings.TrimSpace(strings.TrimPrefix(raw, fields[0]))
+	switch cmd {
+	case "/goal":
+		switch strings.ToLower(arg) {
+		case "", "on", "start", "true", "1", "off", "stop", "false", "0":
+			return false
+		default:
+			return true
+		}
+	case "/plan":
+		return m.plan // the second /plan approves the plan and starts execution
+	case "/compact":
+		return len(m.messages) > 0
+	case "/init":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *tuiModel) queueText(text string) {
@@ -1633,6 +1671,7 @@ func (m *tuiModel) finishReply(text string, usage Usage, quota Quota) (tea.Model
 	m.cancel = nil
 	m.streamCh = nil
 	m.streamBuf = ""
+	m.streamRecoveries = 0
 
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
@@ -1972,6 +2011,7 @@ func (m *tuiModel) answerAsk(choice string) (tea.Model, tea.Cmd) {
 	m.askQ = ""
 	m.askOpts = nil
 	m.askSel = 0
+	m.mode = modeThinking
 	return m, m.advanceTools()
 }
 
@@ -2565,33 +2605,54 @@ func streamPreview(buf string) string {
 }
 
 func (m *tuiModel) recoverStreamError(err error) tea.Cmd {
-	if !errors.Is(err, ErrStreamClosedEarly) || strings.TrimSpace(m.streamBuf) == "" {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return nil
 	}
 	text := m.streamBuf
+	hasPartial := strings.TrimSpace(text) != ""
+	if m.streamRecoveries >= maxStreamRecoveries || (!hasPartial && !errors.Is(err, ErrStreamClosedEarly) && !isTransientAIError(err)) {
+		return nil
+	}
+	m.streamRecoveries++
+	if m.health != nil {
+		m.health.recordStreamError()
+	}
 	m.cancel = nil
 	m.streamCh = nil
 	m.streamBuf = ""
 
-	narration, calls := parseResponse(text)
-	if len(calls) > 0 {
-		m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: text})
-		if narration != "" {
-			m.push(m.renderAssistant(narration))
-			m.toRemote("stream", narration)
-		}
-		m.push(stHint.Render("  ↻ stream ended early — recovered complete tool call(s)"))
-		m.pending = calls
-		m.results = nil
-		return m.advanceTools()
+	if !hasPartial {
+		m.push(stHint.Render("  ↻ stream interrupted before the reply started — retrying"))
+		return m.startReply()
 	}
+
+	// Keep the partial assistant turn in history so the retry can see exactly
+	// where it stopped instead of guessing from a detached error message.
+	m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: text})
+	narration, calls := parseResponse(text)
+	if narration != "" {
+		m.push(m.renderAssistant(narration))
+		m.toRemote("stream", narration)
+	}
+
 	if hasIncompleteToolBlock(text) {
 		m.push(stHint.Render("  ↻ stream ended mid-tool-call — asking the model to resend it"))
 		m.messages = append(m.messages, ChatMessage{Role: "user", Content: toolCallRecoveryPrompt(text)})
 		return m.startReply()
 	}
-	return nil
+	if len(calls) > 0 {
+		m.push(stHint.Render("  ↻ stream ended early — recovered complete tool call(s)"))
+		m.pending = calls
+		m.results = nil
+		return m.advanceTools()
+	}
+
+	m.push(stHint.Render("  ↻ stream interrupted — asking the model to continue"))
+	m.messages = append(m.messages, ChatMessage{Role: "user", Content: streamContinuationPrompt})
+	return m.startReply()
 }
+
+const streamContinuationPrompt = "The stream was interrupted after your previous partial reply. Continue from exactly where it stopped. Do not repeat text or tool calls already present above."
 
 func hasIncompleteToolBlock(text string) bool {
 	lower := strings.ToLower(text)
@@ -2847,8 +2908,15 @@ func (m *tuiModel) statusLine() string {
 	default:
 		scroll := "wheel/pgup/pgdn scroll · drag selects"
 		line := "  " + m.contextUsageString() + " · enter ↵ send · alt+↵ newline · ctrl+v paste image · " + scroll + " · / commands"
+		var badges []string
 		if m.cowork {
-			line = stAccent.Render("  cowork") + stHint.Render(" · ") + strings.TrimLeft(line, " ")
+			badges = append(badges, "cowork")
+		}
+		if m.goal {
+			badges = append(badges, "goal")
+		}
+		if len(badges) > 0 {
+			line = stAccent.Render("  "+strings.Join(badges, " · ")) + stHint.Render(" · ") + strings.TrimLeft(line, " ")
 		}
 		return stHint.Render(line)
 	}
@@ -3380,6 +3448,10 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 	case "/plan":
 		m.plan = !m.plan
 		if m.plan {
+			if m.goal {
+				m.goal = false
+				m.push(stHint.Render("  goal mode off — plan and goal modes can't run together"))
+			}
 			m.push(stOK.Render("  plan mode on — the agent will explore read-only and propose a plan"))
 			m.push(stHint.Render("  run /plan again to approve the plan and execute it"))
 		} else {
@@ -3394,12 +3466,20 @@ func (m *tuiModel) runSlash(line string, remote bool) (tea.Model, tea.Cmd) {
 		case "", "on", "start", "true", "1":
 			m.goal = !m.goal
 			if m.goal {
+				if m.plan {
+					m.plan = false
+					m.push(stHint.Render("  plan mode off — plan and goal modes can't run together"))
+				}
 				m.enableGoalMode()
 			} else {
 				m.push(stHint.Render("  goal mode off"))
 			}
 		default:
 			m.goal = true
+			if m.plan {
+				m.plan = false
+				m.push(stHint.Render("  plan mode off — plan and goal modes can't run together"))
+			}
 			m.enableGoalMode()
 			return m.submitText(arg)
 		}

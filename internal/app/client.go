@@ -143,8 +143,11 @@ type Client struct {
 
 func NewClient(cfg *Config) *Client {
 	return &Client{
-		cfg:    cfg,
-		http:   &http.Client{Timeout: 5 * time.Minute},
+		cfg: cfg,
+		// No whole-request timeout here: http.Client.Timeout includes reading the
+		// response body, which would cut long SSE streams off mid-reply. Non-SSE
+		// requests get a bounded context in do; streams are canceled by the caller.
+		http:   &http.Client{},
 		vision: map[string]bool{},
 	}
 }
@@ -218,18 +221,6 @@ var ErrStreamClosedEarly = errors.New("stream closed before done event")
 // buildBody marshals a request, prepending the system prompt as the first
 // message (the endpoint ignores a top-level "system" field when "messages"
 // is present).
-// fewShot is a tiny demonstration of the read → edit → result → done flow,
-// prepended to every request. It strongly cues weaker models to actually emit
-// tool calls (instead of refusing or replying "Done" without acting).
-var fewShot = []wireMessage{
-	{Role: "user", Content: "In config.py set PORT to 80."},
-	{Role: "assistant", Content: "<tool name=\"read_file\">\n{\"path\": \"config.py\"}\n</tool>"},
-	{Role: "user", Content: "<tool_result name=\"read_file\">\n     1\tPORT = 8080\n</tool_result>"},
-	{Role: "assistant", Content: "<tool name=\"edit_file\">\n{\"path\": \"config.py\", \"old_string\": \"PORT = 8080\", \"new_string\": \"PORT = 80\"}\n</tool>"},
-	{Role: "user", Content: "<tool_result name=\"edit_file\">\nEDIT APPLIED: config.py (1 replacement).\n</tool_result>"},
-	{Role: "assistant", Content: "Done — set `PORT` to 80 in `config.py`."},
-}
-
 const maxAPIMessages = 50
 
 func (c *Client) buildBody(system string, msgs []ChatMessage, stream, fewshot bool) ([]byte, error) {
@@ -237,9 +228,7 @@ func (c *Client) buildBody(system string, msgs []ChatMessage, stream, fewshot bo
 	if strings.TrimSpace(system) != "" {
 		prefix = append(prefix, wireMessage{Role: "system", Content: system})
 	}
-	if fewshot {
-		prefix = append(prefix, fewShot...)
-	}
+	_ = fewshot
 
 	budget := maxAPIMessages - len(prefix)
 	history := c.toWire(msgs)
@@ -281,16 +270,63 @@ func (c *Client) newRequest(ctx context.Context, body []byte) (*http.Request, er
 	return req, nil
 }
 
-// do POSTs body, retrying up to twice on transient upstream errors
-// (502/503/504) and network failures, as the API recommends for 502s.
+const (
+	maxAIRequestAttempts    = 6
+	nonStreamRequestTimeout = 5 * time.Minute
+)
+
+func waitForRetry(ctx context.Context, attempt int) error {
+	delays := []time.Duration{
+		600 * time.Millisecond,
+		1200 * time.Millisecond,
+		2500 * time.Millisecond,
+		5 * time.Second,
+		10 * time.Second,
+	}
+	d := delays[len(delays)-1]
+	if attempt >= 0 && attempt < len(delays) {
+		d = delays[attempt]
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+func isTransientHTTPStatus(sc int) bool {
+	return sc == http.StatusRequestTimeout || sc == http.StatusTooManyRequests || (sc >= 500 && sc != http.StatusNotImplemented && sc != http.StatusHTTPVersionNotSupported)
+}
+
+func isTransientAIText(text string) bool {
+	text = strings.ToLower(text)
+	return strings.Contains(text, "temporarily unavailable") ||
+		strings.Contains(text, "temporarily unavalible") ||
+		strings.Contains(text, "service unavailable") ||
+		strings.Contains(text, "upstream") ||
+		strings.Contains(text, "overloaded") ||
+		strings.Contains(text, "rate limit") ||
+		strings.Contains(text, "try again")
+}
+
+func isTransientAIError(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled) && isTransientAIText(err.Error())
+}
+
+// do POSTs body, retrying transient upstream errors and network failures.
 func (c *Client) do(ctx context.Context, body []byte, sse bool) (*http.Response, error) {
+	if !sse {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, nonStreamRequestTimeout)
+		defer cancel()
+	}
+
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < maxAIRequestAttempts; attempt++ {
 		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * 600 * time.Millisecond):
+			if err := waitForRetry(ctx, attempt-1); err != nil {
+				return nil, err
 			}
 		}
 		req, err := c.newRequest(ctx, body)
@@ -305,9 +341,14 @@ func (c *Client) do(ctx context.Context, body []byte, sse bool) (*http.Response,
 			lastErr = err
 			continue
 		}
-		if sc := resp.StatusCode; sc == 502 || sc == 503 || sc == 504 {
+		if sc := resp.StatusCode; isTransientHTTPStatus(sc) {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			lastErr = fmt.Errorf("API %d (upstream temporarily unavailable)", sc)
+			msg := strings.TrimSpace(string(data))
+			if msg == "" {
+				msg = "upstream temporarily unavailable"
+			}
+			lastErr = fmt.Errorf("API %d: %s", sc, oneLine(msg, 400))
 			continue
 		}
 		return resp, nil
@@ -378,8 +419,7 @@ func (c *Client) Chat(ctx context.Context, system string, msgs []ChatMessage) (*
 }
 
 // Summarize asks the model to compress the conversation into a brief that lets
-// work continue — used for /compact. The few-shot demo is omitted so it isn't
-// folded into the summary.
+// work continue — used for /compact.
 func (c *Client) Summarize(ctx context.Context, msgs []ChatMessage) (string, error) {
 	conv := append(append([]ChatMessage(nil), msgs...), ChatMessage{
 		Role: "user",
@@ -418,30 +458,44 @@ func (c *Client) send(ctx context.Context, body []byte) (*ChatResult, error) {
 		appendDebug(dbg, "REQUEST", string(body))
 	}
 
-	resp, err := c.do(ctx, body, false)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	data, _ := io.ReadAll(resp.Body)
-
-	if dbg := os.Getenv("NOCTURNE_DEBUG"); dbg != "" {
-		appendDebug(dbg, "RESPONSE", string(data))
-	}
-
-	var cr chatResponse
-	_ = json.Unmarshal(data, &cr)
-
-	if resp.StatusCode >= 400 || (!cr.OK && cr.Response == "") {
-		msg := firstNonEmpty(cr.Error, cr.Message, strings.TrimSpace(string(data)))
-		if msg == "" {
-			msg = resp.Status
+	var lastErr error
+	for attempt := 0; attempt < maxAIRequestAttempts; attempt++ {
+		if attempt > 0 {
+			if err := waitForRetry(ctx, attempt-1); err != nil {
+				return nil, err
+			}
 		}
-		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, oneLine(msg, 400))
-	}
 
-	return &ChatResult{Text: cr.Response, Usage: cr.Usage, Quota: cr.Quota}, nil
+		resp, err := c.do(ctx, body, false)
+		if err != nil {
+			return nil, err
+		}
+
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if dbg := os.Getenv("NOCTURNE_DEBUG"); dbg != "" {
+			appendDebug(dbg, "RESPONSE", string(data))
+		}
+
+		var cr chatResponse
+		_ = json.Unmarshal(data, &cr)
+
+		if resp.StatusCode >= 400 || (!cr.OK && cr.Response == "") {
+			msg := firstNonEmpty(cr.Error, cr.Message, strings.TrimSpace(string(data)))
+			if msg == "" {
+				msg = resp.Status
+			}
+			lastErr = fmt.Errorf("API %d: %s", resp.StatusCode, oneLine(msg, 400))
+			if isTransientAIError(lastErr) {
+				continue
+			}
+			return nil, lastErr
+		}
+
+		return &ChatResult{Text: cr.Response, Usage: cr.Usage, Quota: cr.Quota}, nil
+	}
+	return nil, lastErr
 }
 
 // visionDescribePrompt asks a vision model to transcribe an image thoroughly so
@@ -596,59 +650,114 @@ func (c *Client) ChatStream(ctx context.Context, system string, msgs []ChatMessa
 		appendDebug(dbg, "REQUEST(stream)", string(body))
 	}
 
-	resp, err := c.do(ctx, body, true)
-	if err != nil {
-		out <- StreamEvent{Err: err}
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		data, _ := io.ReadAll(resp.Body)
-		out <- StreamEvent{Err: fmt.Errorf("API %d: %s", resp.StatusCode, oneLine(string(data), 400))}
-		return
-	}
-
-	gotDone := false
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(line[len("data:"):])
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		var ev struct {
-			Type  string `json:"type"`
-			Text  string `json:"text"`
-			Error string `json:"error"`
-			Usage Usage  `json:"usage"`
-			Quota Quota  `json:"quota"`
-		}
-		if json.Unmarshal([]byte(payload), &ev) != nil {
-			continue
-		}
-		switch ev.Type {
-		case "delta":
-			if ev.Text != "" {
-				out <- StreamEvent{Delta: ev.Text}
+	var lastErr error
+	for attempt := 0; attempt < maxAIRequestAttempts; attempt++ {
+		if attempt > 0 {
+			if err := waitForRetry(ctx, attempt-1); err != nil {
+				out <- StreamEvent{Err: err}
+				return
 			}
-		case "done":
-			gotDone = true
-			out <- StreamEvent{Done: true, Usage: ev.Usage, Quota: ev.Quota}
-		case "error":
-			out <- StreamEvent{Err: fmt.Errorf("%s", firstNonEmpty(ev.Error, "stream error"))}
+		}
+
+		resp, err := c.do(ctx, body, true)
+		if err != nil {
+			lastErr = err
+			if isTransientAIError(err) {
+				continue
+			}
+			out <- StreamEvent{Err: err}
 			return
 		}
+
+		if resp.StatusCode >= 400 {
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("API %d: %s", resp.StatusCode, oneLine(string(data), 400))
+			if isTransientAIError(lastErr) {
+				continue
+			}
+			out <- StreamEvent{Err: lastErr}
+			return
+		}
+
+		gotDone := false
+		sentDelta := false
+		retry := false
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(line[len("data:"):])
+			if payload == "" || payload == "[DONE]" {
+				continue
+			}
+			var ev struct {
+				Type  string `json:"type"`
+				Text  string `json:"text"`
+				Error string `json:"error"`
+				Usage Usage  `json:"usage"`
+				Quota Quota  `json:"quota"`
+			}
+			if json.Unmarshal([]byte(payload), &ev) != nil {
+				continue
+			}
+			switch ev.Type {
+			case "delta":
+				if ev.Text != "" {
+					sentDelta = true
+					out <- StreamEvent{Delta: ev.Text}
+				}
+			case "done":
+				gotDone = true
+				out <- StreamEvent{Done: true, Usage: ev.Usage, Quota: ev.Quota}
+			case "error":
+				lastErr = fmt.Errorf("%s", firstNonEmpty(ev.Error, "stream error"))
+				if !sentDelta && isTransientAIError(lastErr) {
+					retry = true
+					break
+				}
+				resp.Body.Close()
+				out <- StreamEvent{Err: lastErr}
+				return
+			}
+			if retry || gotDone {
+				break
+			}
+		}
+		resp.Body.Close()
+
+		if gotDone {
+			return
+		}
+		if retry {
+			continue
+		}
+		if ctx.Err() != nil {
+			out <- StreamEvent{Err: ctx.Err()}
+			return
+		}
+		if err := sc.Err(); err != nil {
+			lastErr = err
+			if !sentDelta {
+				continue
+			}
+			out <- StreamEvent{Err: err}
+			return
+		}
+		lastErr = ErrStreamClosedEarly
+		if !sentDelta {
+			continue
+		}
+		out <- StreamEvent{Err: lastErr}
+		return
 	}
-	if err := sc.Err(); err != nil && ctx.Err() == nil {
-		out <- StreamEvent{Err: err}
-	} else if !gotDone && ctx.Err() == nil {
-		out <- StreamEvent{Err: ErrStreamClosedEarly}
+	if lastErr == nil {
+		lastErr = ErrStreamClosedEarly
 	}
+	out <- StreamEvent{Err: lastErr}
 }
 
 // ErrInvalidKey marks a key the server actively rejected (401/403) — expired

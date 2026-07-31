@@ -39,11 +39,11 @@ func TestParseExtraBrace(t *testing.T) {
 
 func TestParseLiteralNewlines(t *testing.T) {
 	// Raw newline inside a JSON string (invalid JSON) — kimi-k2.6 does this.
-	_, calls := parseResponse("<tool name=\"edit_file\">\n{\"path\": \"a.py\", \"old_string\": \"PORT = 8080\nDEBUG = False\", \"new_string\": \"PORT = 80\"}\n</tool>")
+	_, calls := parseResponse("<tool name=\"edit_file\">\n{\"path\": \"a.py\", \"old_string\": \"first line\nsecond line\", \"new_string\": \"replacement\"}\n</tool>")
 	if len(calls) != 1 {
 		t.Fatalf("want 1 call, got %d", len(calls))
 	}
-	if got := argStr(calls[0].Args, "old_string"); got != "PORT = 8080\nDEBUG = False" {
+	if got := argStr(calls[0].Args, "old_string"); got != "first line\nsecond line" {
 		t.Fatalf("old_string not repaired: %q", got)
 	}
 }

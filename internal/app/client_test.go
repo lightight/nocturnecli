@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestBuildBodyCapsMessagesWithFewShotAndSystem(t *testing.T) {
+func TestBuildBodyCapsMessagesWithSystem(t *testing.T) {
 	c := NewClient(&Config{Model: DefaultModel, BaseURL: DefaultBaseURL, Stream: true})
 	msgs := make([]ChatMessage, 60)
 	for i := range msgs {
@@ -27,11 +27,8 @@ func TestBuildBodyCapsMessagesWithFewShotAndSystem(t *testing.T) {
 	if req.Messages[0].Role != "system" || req.Messages[0].Content != "system prompt" {
 		t.Fatalf("first message = %#v, want system prompt", req.Messages[0])
 	}
-	if got := req.Messages[1 : 1+len(fewShot)]; len(got) != len(fewShot) {
-		t.Fatalf("few-shot length = %d, want %d", len(got), len(fewShot))
-	}
-	wantHistory := maxAPIMessages - 1 - len(fewShot)
-	if got := len(req.Messages) - 1 - len(fewShot); got != wantHistory {
+	wantHistory := maxAPIMessages - 1
+	if got := len(req.Messages) - 1; got != wantHistory {
 		t.Fatalf("history messages kept = %d, want %d", got, wantHistory)
 	}
 }
