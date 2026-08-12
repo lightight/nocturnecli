@@ -23,12 +23,17 @@ dist/nocturne_windows_arm64.exe
 ## Run
 
 ```sh
-./nocturne serve --addr :8080 --bin ./dist
+./nocturne serve --addr :8080 --bin ./dist --update-version v0.4.0
 ```
 
 `--bin` is optional. If it is present, `/install.sh` and `/install.ps1` first
 try to download from `/bin/` on the same host. If a binary is missing, the
 installers fall back to GitHub Releases and then `go install`.
+
+`/update.json` and `/version` advertise the downloadable CLI version. Set it
+with `--update-version`, `NOCTURNE_UPDATE_VERSION`, or a `VERSION` file in the
+`--bin` directory. If none is provided, the server falls back to its own compiled
+version.
 
 ## Anonymous problem reports
 

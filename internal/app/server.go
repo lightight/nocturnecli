@@ -17,11 +17,12 @@ import (
 // ServerAssets are the static files baked into the binary and served by
 // `nocturne serve` (the docs landing page + install scripts).
 type ServerAssets struct {
-	Docs       string
-	InstallSh  string
-	InstallPs1 string
-	BinDir     string // optional directory of prebuilt binaries to serve at /bin/
-	ReportsDir string // optional directory to store sealed anonymous reports in
+	Docs          string
+	InstallSh     string
+	InstallPs1    string
+	BinDir        string // optional directory of prebuilt binaries to serve at /bin/
+	ReportsDir    string // optional directory to store sealed anonymous reports in
+	UpdateVersion string // optional version advertised by /version and /update.json
 }
 
 // RunServer hosts the docs site + install scripts + the end-to-end-encrypted
@@ -46,10 +47,21 @@ func RunServer(args []string, assets ServerAssets) error {
 				assets.ReportsDir = args[i+1]
 				i++
 			}
+		case "-update-version", "--update-version":
+			if i+1 < len(args) {
+				assets.UpdateVersion = args[i+1]
+				i++
+			}
 		}
 	}
 	if assets.ReportsDir == "" {
 		assets.ReportsDir = os.Getenv("NOCTURNE_REPORTS_DIR")
+	}
+	if assets.UpdateVersion == "" {
+		assets.UpdateVersion = os.Getenv("NOCTURNE_UPDATE_VERSION")
+	}
+	if assets.UpdateVersion == "" && assets.BinDir != "" {
+		assets.UpdateVersion = readUpdateVersionFile(assets.BinDir)
 	}
 	srv := newRelayServer(assets)
 	fmt.Printf("Nocturne site + relay listening on %s\n", addr)
@@ -163,6 +175,19 @@ func baseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
+func readUpdateVersionFile(binDir string) string {
+	for _, name := range []string{"VERSION", "version", "update.version"} {
+		b, err := os.ReadFile(filepath.Join(binDir, name))
+		if err != nil {
+			continue
+		}
+		if v := strings.TrimSpace(string(b)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // maxReportBytes caps one sealed report. Payloads are small (aggregate counts
 // only); the cap keeps the unauthenticated endpoint from becoming a disk fill.
 const maxReportBytes = 256 << 10
@@ -204,14 +229,21 @@ func (s *relayServer) index(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, s.assets.Docs)
 }
 
+func (s *relayServer) updateVersion() string {
+	if v := strings.TrimSpace(s.assets.UpdateVersion); v != "" {
+		return v
+	}
+	return Version
+}
+
 func (s *relayServer) version(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, Version+"\n")
+	io.WriteString(w, s.updateVersion()+"\n")
 }
 
 func (s *relayServer) updateJSON(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	resp := map[string]string{"version": Version}
+	resp := map[string]string{"version": s.updateVersion()}
 	// Point the client at the binary for *its* platform, taken from the os/arch
 	// query params the CLI sends — never the server's own platform. Without
 	// params (old clients, browsers) omit the URL so the client falls back to
