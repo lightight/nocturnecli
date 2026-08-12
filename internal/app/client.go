@@ -70,6 +70,34 @@ type ModelInfo struct {
 	OutPrice  float64 // $ per 1M output tokens
 }
 
+var hardcodedModelIDs = []string{
+	"nocturne:flash",
+	"llama-3.3-70b-versatile",
+	"openai/gpt-oss-120b",
+	"qwen/qwen3-32b",
+	"meta-llama/llama-4-scout-17b-16e-instruct",
+	"navy:gpt-5.4-mini",
+	"navy:gpt-4o-mini-search-preview",
+	"navy:gemini-3.1-pro-preview",
+	"navy:gemini-3.5-flash",
+	"navy:grok-4.3",
+	"navy:grok-4.1-fast-reasoning",
+	"navy:deepseek-v4-pro",
+	"navy:llama-4-scout",
+	"navy:mistral-medium-latest",
+	"navy:kimi-k2.6",
+	"navy:nemotron-3-super",
+	"navy:mimo-v2.5-pro",
+	"navy:c4ai-aya-expanse-32b",
+	"navy:gpt-4o",
+	"navy:kimi-k2.5",
+	"navy:qwen3.5-397b-a17b",
+	"navy:hermes-4-405b",
+	"navy:mistral-medium-3.5",
+	"navy:claude-opus-5",
+	"navy:gpt-5.5",
+}
+
 func knownModelInfo(id string) (ModelInfo, bool) {
 	id = strings.TrimSpace(id)
 	switch id {
@@ -88,9 +116,7 @@ func knownModelInfo(id string) (ModelInfo, bool) {
 	}
 
 	models := map[string]ModelInfo{
-		// The current public /api/ai/config no longer lists navy:gpt-5.5, but keep
-		// an entry so older configs that still point at it have sane UI.
-		DefaultModel: {ID: DefaultModel, Label: "GPT-5.5", Company: "OpenAI", Reasoning: true, MaxTokens: 500_000},
+		"nocturne:flash": {ID: "nocturne:flash", Label: "Nocturne Flash", Company: "Nocturne", MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
 
 		"llama-3.3-70b-versatile":                   {ID: "llama-3.3-70b-versatile", Label: "Llama 3.3 70B (Versatile)", Company: "Llama", Reasoning: true, MaxTokens: 256_000, InPrice: 0.5, OutPrice: 2},
 		"openai/gpt-oss-120b":                       {ID: "openai/gpt-oss-120b", Label: "GPT-OSS 120B", Company: "ChatGPT", Reasoning: true, MaxTokens: 500_000, InPrice: 0.5, OutPrice: 2},
@@ -116,6 +142,8 @@ func knownModelInfo(id string) (ModelInfo, bool) {
 		"navy:qwen3.5-397b-a17b":          {ID: "navy:qwen3.5-397b-a17b", Label: "Qwen3.5 397B A17B", Company: "Qwen", Reasoning: true, MaxTokens: 500_000, InPrice: 1, OutPrice: 4},
 		"navy:hermes-4-405b":              {ID: "navy:hermes-4-405b", Label: "Hermes 4 405B", Company: "Hermes", Reasoning: true, MaxTokens: 500_000, InPrice: 1, OutPrice: 4},
 		"navy:mistral-medium-3.5":         {ID: "navy:mistral-medium-3.5", Label: "Mistral Medium 3.5", Company: "Mistral", Reasoning: true, MaxTokens: 256_000, InPrice: 1, OutPrice: 4},
+		"navy:claude-opus-5":              {ID: "navy:claude-opus-5", Label: "Claude Opus 5", Company: "Claude", Reasoning: true, Vision: true, MaxTokens: 500_000, InPrice: 3, OutPrice: 12},
+		DefaultModel:                      {ID: DefaultModel, Label: "GPT-5.5", Company: "OpenAI", Reasoning: true, MaxTokens: 500_000, InPrice: 3, OutPrice: 12},
 	}
 	md, ok := models[id]
 	return md, ok
@@ -844,7 +872,8 @@ func (c *Client) FetchModels(ctx context.Context) ([]ModelInfo, string, error) {
 		return nil, "", err
 	}
 
-	out := make([]ModelInfo, 0, len(cfg.Models))
+	out := make([]ModelInfo, 0, len(cfg.Models)+len(hardcodedModelIDs))
+	have := make(map[string]bool, len(cfg.Models)+len(hardcodedModelIDs))
 	for _, m := range cfg.Models {
 		md := ModelInfo{
 			ID: m.ID, Label: m.Label, Company: m.Company,
@@ -853,6 +882,18 @@ func (c *Client) FetchModels(ctx context.Context) ([]ModelInfo, string, error) {
 		}
 		md.MaxTokens = advertisedContextLimit(md)
 		out = append(out, md)
+		have[md.ID] = true
+	}
+	for _, id := range hardcodedModelIDs {
+		if id == "" || have[id] {
+			continue
+		}
+		have[id] = true
+		if md, ok := knownModelInfo(id); ok {
+			out = append(out, md)
+		} else {
+			out = append(out, ModelInfo{ID: id})
+		}
 	}
 	return out, cfg.DefaultModel, nil
 }
