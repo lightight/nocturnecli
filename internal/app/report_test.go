@@ -58,7 +58,8 @@ func TestReportPayloadAllowlist(t *testing.T) {
 	allowed := map[string]bool{
 		"v": true, "id": true, "time": true, "version": true, "goos": true,
 		"goarch": true, "model": true, "level": true, "counts": true,
-		"tools": true, "json_errors": true, "messages": true, "duration_secs": true,
+		"hiccups": true, "tools": true, "json_errors": true, "messages": true,
+		"duration_secs": true,
 	}
 	for k := range m {
 		if !allowed[k] {
@@ -122,5 +123,32 @@ func TestHealthTrackerIssuesExcludesRounds(t *testing.T) {
 	h.recordEmptyReply()
 	if h.issues() != 1 {
 		t.Fatalf("issues: %d", h.issues())
+	}
+}
+
+func TestHiccupTimeline(t *testing.T) {
+	// The timeline must say WHERE each hiccup happened, in order, without any
+	// content — position + category + tool name only.
+	h := newHealthTracker()
+	h.recordRound()
+	h.recordRound()
+	h.recordBadCall(ToolCall{Name: "write", Args: map[string]any{"__truncated": true}}, "")
+	h.recordRound()
+	h.recordEmptyReply()
+	if len(h.events) != 2 {
+		t.Fatalf("events: %+v", h.events)
+	}
+	if h.events[0] != (hiccupEvent{At: 2, Kind: "bad_call_truncated", Tool: "write_file"}) {
+		t.Fatalf("event 0 wrong: %+v", h.events[0])
+	}
+	if h.events[1] != (hiccupEvent{At: 3, Kind: "empty_reply"}) {
+		t.Fatalf("event 1 wrong: %+v", h.events[1])
+	}
+	// The timeline is capped so a pathological session can't bloat the report.
+	for i := 0; i < maxHiccupEvents+10; i++ {
+		h.recordStreamError()
+	}
+	if len(h.events) != maxHiccupEvents {
+		t.Fatalf("timeline not capped: %d events", len(h.events))
 	}
 }

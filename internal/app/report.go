@@ -9,9 +9,11 @@ package app
 //   - strictly opt-in: nothing is ever sent without an explicit /report send
 //     (or NOCTURNE_SEND_REPORT=1 in headless mode)
 //   - no user-identifiable data: the payload carries only aggregate event
-//     counts, tool names, sanitized JSON-decoder error kinds, version/OS/arch,
-//     and the model id. No prompts, paths, file contents, commands, args,
-//     session IDs, API key, account, or cwd — see the allowlist test.
+//     counts, an anonymous hiccup timeline (where in the session each hiccup
+//     happened: position + category + tool name), tool names, sanitized
+//     JSON-decoder error kinds, version/OS/arch, and the model id. No prompts,
+//     paths, file contents, commands, args, session IDs, API key, account, or
+//     cwd — see the allowlist test.
 //   - end-to-end encrypted: the payload is sealed to the team's X25519 public
 //     key (embedded below) with an ephemeral key + HKDF-SHA256 + AES-256-GCM.
 //     The server only stores the sealed box; it cannot read it.
@@ -54,43 +56,77 @@ const reportAlg = "x25519-hkdfsha256-aes256gcm"
 // mentions that a report would help. Breaker trips hint immediately.
 const reportHintThreshold = 3
 
+// hiccupEvent is one entry in the session timeline: what kind of hiccup and
+// where in the session it happened. `At` is the round number in headless mode
+// and the message count in the TUI. No content — position + category only.
+type hiccupEvent struct {
+	At   int    `json:"at"`
+	Kind string `json:"kind"`
+	Tool string `json:"tool,omitempty"`
+}
+
+// maxHiccupEvents caps the timeline so a pathological session can't grow the
+// payload without bound.
+const maxHiccupEvents = 25
+
 // healthTracker counts reliability hiccups in one session. It never stores
-// content — only categories, tool names, and sanitized error kinds.
+// content — only categories, tool names, sanitized error kinds, and where in
+// the session each hiccup happened.
 type healthTracker struct {
 	counts   map[string]int
 	tools    map[string]bool
 	jsonErrs map[string]bool
+	at       int
+	events   []hiccupEvent
 }
 
 func newHealthTracker() *healthTracker {
 	return &healthTracker{counts: map[string]int{}, tools: map[string]bool{}, jsonErrs: map[string]bool{}}
 }
 
+// notePos marks the current session position (message count in the TUI) so
+// hiccups recorded afterwards can say where they happened. Headless mode gets
+// its position from recordRound instead.
+func (h *healthTracker) notePos(at int) { h.at = at }
+
+func (h *healthTracker) add(kind, tool string) {
+	h.counts[kind]++
+	if len(h.events) < maxHiccupEvents {
+		h.events = append(h.events, hiccupEvent{At: h.at, Kind: kind, Tool: tool})
+	}
+}
+
 // recordBadCall categorizes a call diagnoseBadToolCall rejected.
 func (h *healthTracker) recordBadCall(tc ToolCall, diagnosis string) {
+	var kind string
 	switch {
 	case tc.Args["__truncated"] != nil:
-		h.counts["bad_call_truncated"]++
+		kind = "bad_call_truncated"
 	case tc.Args["__parse_error"] != nil:
-		h.counts["bad_call_json"]++
+		kind = "bad_call_json"
 		if detail, _ := tc.Args["__err"].(string); detail != "" && len(h.jsonErrs) < 5 {
 			h.jsonErrs[redactJSONError(detail)] = true
 		}
 	case strings.Contains(diagnosis, "not a known tool"):
-		h.counts["bad_call_unknown_tool"]++
+		kind = "bad_call_unknown_tool"
 	default:
-		h.counts["bad_call_missing_arg"]++
+		kind = "bad_call_missing_arg"
 	}
-	if name := canonicalTool(tc.Name); name != "" {
+	name := canonicalTool(tc.Name)
+	h.add(kind, name)
+	if name != "" {
 		h.tools[name] = true
 	}
 }
 
-func (h *healthTracker) recordEmptyReply()  { h.counts["empty_reply"]++ }
-func (h *healthTracker) recordStreamError() { h.counts["stream_error"]++ }
-func (h *healthTracker) recordBreakerTrip() { h.counts["breaker_trip"]++ }
-func (h *healthTracker) recordAPIError()    { h.counts["api_error"]++ }
-func (h *healthTracker) recordRound()       { h.counts["rounds"]++ }
+func (h *healthTracker) recordEmptyReply()  { h.add("empty_reply", "") }
+func (h *healthTracker) recordStreamError() { h.add("stream_error", "") }
+func (h *healthTracker) recordBreakerTrip() { h.add("breaker_trip", "") }
+func (h *healthTracker) recordAPIError()    { h.add("api_error", "") }
+func (h *healthTracker) recordRound() {
+	h.counts["rounds"]++
+	h.at = h.counts["rounds"]
+}
 
 func (h *healthTracker) issues() int {
 	n := 0
@@ -125,6 +161,7 @@ type reportPayload struct {
 	Model    string         `json:"model"`
 	Level    string         `json:"level,omitempty"`
 	Counts   map[string]int `json:"counts"`
+	Hiccups  []hiccupEvent  `json:"hiccups,omitempty"`
 	Tools    []string       `json:"tools,omitempty"`
 	JSONErrs []string       `json:"json_errors,omitempty"`
 	Messages int            `json:"messages"`
@@ -145,6 +182,7 @@ func buildReport(h *healthTracker, cfg *Config, version string, messages int, st
 		Model:   cfg.Model,
 		Level:   cfg.Level,
 		Counts:  h.counts,
+		Hiccups: h.events,
 	}
 	for t := range h.tools {
 		p.Tools = append(p.Tools, t)

@@ -1615,6 +1615,7 @@ func (m *tuiModel) replyError(err error) {
 	}
 	m.push(stErr.Render("  ✗ " + err.Error()))
 	m.toRemote("status", "✗ "+err.Error())
+	m.health.notePos(len(m.messages))
 	if errors.Is(err, ErrStreamClosedEarly) {
 		m.health.recordStreamError()
 	} else {
@@ -1686,6 +1687,7 @@ func (m *tuiModel) finishReply(text string, usage Usage, quota Quota) (tea.Model
 		m.ctxTokens = usage.InputTokens + usage.OutputTokens
 	}
 	m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: text})
+	m.health.notePos(len(m.messages))
 
 	narration, calls := parseResponse(text)
 
