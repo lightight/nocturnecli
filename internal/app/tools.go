@@ -238,8 +238,8 @@ func (b *badCallBreaker) add(tc ToolCall) bool {
 func (b *badCallBreaker) reset() { b.key, b.n = "", 0 }
 
 // maxEmptyNudges bounds how many times the agent loops poke the model after it
-// replies with no tool call and no message (pure whitespace, or only a
-// hallucinated <tool_result> block) before giving up.
+// stalls — replying with no tool call and no message (pure whitespace, or only a
+// hallucinated <tool_result> block) or only a promise to act — before giving up.
 const maxEmptyNudges = 2
 
 // emptyReply reports whether a parsed reply carries nothing at all: no tool
@@ -250,10 +250,63 @@ func emptyReply(narration string, calls []ToolCall) bool {
 	return len(calls) == 0 && strings.TrimSpace(narration) == ""
 }
 
+// intentPhrases mark a reply that only announces what the model is ABOUT to do.
+// A reply like "I'll inspect the project structure first." with no tool call
+// ends the turn with nothing done — the announced action never happens.
+var intentPhrases = []string{
+	"i'll ", "i will ", "let me ", "i'm going to", "i am going to",
+	"i'm about to", "we'll ", "we will ", "let's ", "i need to ",
+	"i'll start", "first i'll", "first, i'll", "i'll begin",
+}
+
+// intentOnlyReply reports whether a call-less reply is a statement of intent
+// rather than a real answer: it promises future action ("I'll check …") or
+// narrates an action in progress ("Creating index.html…") instead of doing it
+// or reporting a finished result. Final summaries use past tense ("Fixed the
+// parser"), so future-intent phrasing is a reliable stall signal.
+func intentOnlyReply(narration string) bool {
+	text := strings.ToLower(strings.TrimSpace(narration))
+	// Models typically write curly apostrophes ("I’ll"), so fold them before
+	// matching the straight-quote phrases above.
+	text = strings.ReplaceAll(text, "’", "'")
+	if text == "" {
+		return false
+	}
+	for _, p := range intentPhrases {
+		if strings.Contains(text, p) {
+			return true
+		}
+	}
+	return gerundOnlyUpdate(text)
+}
+
+// gerundOnlyUpdate catches one-line action narrations like "Creating
+// `index.html` in the current directory." — a gerund opener with nothing else
+// is a status update, never a final answer, so the turn must not end on it.
+// Kept deliberately narrow (single short line, first word ends in "ing") so
+// real summaries like "Fixed the parser by rewriting the lexer" pass through.
+func gerundOnlyUpdate(text string) bool {
+	if len(text) > 160 || strings.ContainsAny(text, "\n") {
+		return false
+	}
+	first := strings.TrimLeft(text, ">*#- ")
+	if i := strings.IndexAny(first, " `"); i > 0 {
+		first = first[:i]
+	}
+	first = strings.TrimRight(first, ".,:")
+	return strings.HasSuffix(first, "ing")
+}
+
+// stalledReply reports whether a reply ended the turn without doing anything:
+// no tool calls, and either no message at all or only a promise to act.
+func stalledReply(narration string, calls []ToolCall) bool {
+	return emptyReply(narration, calls) || (len(calls) == 0 && intentOnlyReply(narration))
+}
+
 // emptyReplyNudge is fed back as a user message so the model continues instead
-// of the turn silently ending on an empty reply.
-const emptyReplyNudge = "Your previous reply contained no tool call and no message — only whitespace or a stray tool-result block — so nothing happened. " +
-	"Continue the task now: emit the next <tool> call and wait for its result, or if the task is genuinely complete, reply with a short summary."
+// of the turn silently ending on an empty or intent-only reply.
+const emptyReplyNudge = "Your previous reply contained no tool call, so nothing actually happened — saying what you are about to do does not do it. " +
+	"Continue the task now: emit the next <tool> call and wait for its result, or if the task is genuinely complete, reply with a short summary of what is already done."
 
 func missingStringArg(args map[string]any, key string) bool {
 	return strings.TrimSpace(argStr(args, key)) == ""

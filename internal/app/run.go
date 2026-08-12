@@ -244,10 +244,10 @@ func runHeadlessLoop(cfg *Config, prompt string, cowork bool, health *healthTrac
 
 		narration, calls := parseResponse(res.Text)
 		if len(calls) == 0 {
-			if emptyReply(narration, calls) && emptyNudges < maxEmptyNudges {
+			if stalledReply(narration, calls) && emptyNudges < maxEmptyNudges {
 				emptyNudges++
 				health.recordEmptyReply()
-				fmt.Fprintln(os.Stderr, stDim.Render("  ↻ empty reply — asking the model to continue"))
+				fmt.Fprintln(os.Stderr, stDim.Render("  ↻ reply had no tool call — asking the model to continue"))
 				msgs = append(msgs, ChatMessage{Role: "user", Content: emptyReplyNudge})
 				continue
 			}

@@ -1690,10 +1690,10 @@ func (m *tuiModel) finishReply(text string, usage Usage, quota Quota) (tea.Model
 	narration, calls := parseResponse(text)
 
 	if len(calls) == 0 {
-		if emptyReply(narration, calls) && m.emptyNudges < maxEmptyNudges {
+		if stalledReply(narration, calls) && m.emptyNudges < maxEmptyNudges {
 			m.emptyNudges++
 			m.health.recordEmptyReply()
-			m.push(stHint.Render("  ↻ empty reply — asking the model to continue"))
+			m.push(stHint.Render("  ↻ reply had no tool call — asking the model to continue"))
 			m.messages = append(m.messages, ChatMessage{Role: "user", Content: emptyReplyNudge})
 			return m, m.startReply()
 		}

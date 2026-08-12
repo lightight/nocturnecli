@@ -78,10 +78,10 @@ func runSubagentWithProgress(ctx context.Context, cfg *Config, client *Client, w
 		narration, calls := parseResponse(res.Text)
 		if len(calls) == 0 {
 			report := strings.TrimSpace(narration)
-			if report == "" {
+			if report == "" || intentOnlyReply(report) {
 				if emptyNudges < maxEmptyNudges {
 					emptyNudges++
-					reportProgress(pct, "empty reply — nudging model")
+					reportProgress(pct, "reply had no tool call — nudging model")
 					msgs = append(msgs, ChatMessage{Role: "user", Content: emptyReplyNudge})
 					continue
 				}

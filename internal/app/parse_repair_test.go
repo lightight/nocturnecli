@@ -92,6 +92,41 @@ func TestEmptyReply(t *testing.T) {
 	}
 }
 
+func TestStalledReply(t *testing.T) {
+	// Intent-only replies — a promise to act with no tool call — must count as
+	// stalled so the loop nudges the model instead of ending the turn.
+	for _, s := range []string{
+		"I’ll inspect the project structure first so I can build the app.",
+		"Let me check the current directory.",
+		"I will create the files now.",
+		"I'm going to run the tests.",
+		"Creating `index.html` in the current directory.",
+		"Checking the config loader",
+	} {
+		if !stalledReply(s, nil) {
+			t.Fatalf("intent-only reply not detected as stalled: %q", s)
+		}
+	}
+	// Real answers and past-tense summaries must NOT be nudged.
+	for _, s := range []string{
+		"Hi! What would you like to work on?",
+		"Fixed the parser and added tests — `go test ./...` passes.",
+		"The files in /tmp are: a.txt, b.txt.",
+		"Done.\n\n- Created index.html\n- Verified it renders",
+	} {
+		if stalledReply(s, nil) {
+			t.Fatalf("final answer wrongly flagged as stalled: %q", s)
+		}
+	}
+	// Replies with tool calls are never stalled, intent phrasing or not.
+	if stalledReply("I’ll check the directory.", []ToolCall{{Name: "list_dir"}}) {
+		t.Fatal("reply with calls must not be stalled")
+	}
+	if !stalledReply("  ", nil) {
+		t.Fatal("whitespace-only reply should still be stalled")
+	}
+}
+
 func TestParseHallucinatedResultNotTruncated(t *testing.T) {
 	// A hallucinated <tool_result> block must be stripped, not reported as a
 	// truncated tool call.

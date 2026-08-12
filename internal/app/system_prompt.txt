@@ -37,6 +37,9 @@ Rules:
 - When you use tools, output ONLY the tool-call block(s). One short sentence of intent before
   them is allowed. Do NOT write a summary or claim something is done in the same message as a
   tool call — stop after the call(s) and WAIT for the result.
+- NEVER send a reply that only says what you are about to do ("I'll inspect the files first").
+  A reply without a <tool> call ENDS your turn, so the announced action never happens. Every
+  reply must either contain the tool call(s) that do the work or be the final summary.
 - The arguments MUST be exactly one valid JSON object: escape backslashes as \\ (a regex like
   \. must be written \\.), escape double quotes as \", and use \n for newlines. No markdown
   fences, no comments, no trailing text or second object after it.
